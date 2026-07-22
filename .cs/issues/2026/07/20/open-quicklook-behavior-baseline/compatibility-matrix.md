@@ -80,6 +80,15 @@ Explorer 主路径通过新窗口 `/select` 选中同一 `spec.md`，同时验�
 
 自动化为取得前台权限先发送 Alt。QuickLook 4.1.1 会把 Alt 记为无效按键，并在一秒内抑制随后空格；等待超过一秒后测试成功。源码核对确认 `4.5.0` 仍有相同行为，后续 `master` 才通过前台窗口变化事件清除此状态。因此上游 issue `#1939` 的变更是当前第一个明确的候选补丁，但仍需作为独立变化完成回归验证，不能因为它位于 `master` 就整批引入其他提交。
 
+### 导入源码构建基线（2026-07-22）
+
+- 命令：`pwsh -NoProfile -File tests/baseline/legacy-build.tests.ps1`。
+- 环境：Windows 11 专业版 `10.0.22631` x64；Visual Studio Enterprise 2022 `17.14.20`；MSBuild `17.14.23.42201`；WiX Toolset `3.14.1.8722`。
+- 前置条件：本机原先缺少 WiX Toolset；安装官方 WiX 3.14.1 后，构建 wrapper 从机器级 `WIX` 环境读取工具路径。subtree 不保留上游标签拓扑，因此 wrapper 仅在构建期间让上游 `git describe` 得到固定版本 `4.5.0`，未修改 tracked QuickLook 源码。
+- 结果：完整 `QuickLook.sln` Release 构建成功并输出 `LEGACY_BUILD_OK`。构建包含 x64 主程序、Native64 和上游既有的 Native32/WoW64 helper；未发现或构建 ARM64 配置。
+- 产物：`src/legacy/quicklook/Build/Release/QuickLook.exe`（12,507,648 bytes）、`src/legacy/quicklook/Build/QuickLook-4.5.0.msi`（94,425,456 bytes）、`src/legacy/quicklook/Build/QuickLook-4.5.0.zip`（122,532,526 bytes）。
+- 警告：还原时 WiX project 报 `NU1503`，PDF/Thumbnail plugin 报既有 `System.IO.Compression` 版本冲突，Markdown plugin 报成员隐藏，WiX 报 `ICE61`；均未转化为构建错误。本轮只记录这些上游基线信号，不把它们改写为 PreviewIt 产品限制。
+
 每个场景至少记录：
 
 - Broker/旧程序启动到可接收空格的时间；
