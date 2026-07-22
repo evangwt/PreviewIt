@@ -1,6 +1,5 @@
-use std::ffi::c_void;
 use std::io;
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
@@ -10,14 +9,8 @@ use prost::Message;
 use thiserror::Error;
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows_sys::Win32::Security::{
-    GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -27,9 +20,9 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+use crate::windows_security::{CurrentUserSecurity, OwnedHandle, WindowsSecurityError};
 
 const PROTOCOL_MAJOR: u32 = 0;
 const PROTOCOL_MINOR: u32 = 1;
@@ -71,6 +64,13 @@ pub enum BrokerError {
     Frame(#[from] previewit_protocol::FrameError),
 }
 
+impl From<WindowsSecurityError> for BrokerError {
+    fn from(error: WindowsSecurityError) -> Self {
+        let WindowsSecurityError::Windows { operation, source } = error;
+        Self::Windows { operation, source }
+    }
+}
+
 pub struct PipeServer {
     handle: OwnedHandle,
     name: String,
@@ -89,7 +89,7 @@ impl PipeServer {
     ) -> Result<Self, BrokerError> {
         let name = format!("PreviewIt-{}", Uuid::new_v4().simple());
         let full_name = wide(&format!(r"\\.\pipe\{name}"));
-        let security = PipeSecurity::for_current_user()?;
+        let security = CurrentUserSecurity::new()?;
 
         let handle = unsafe {
             CreateNamedPipeW(
@@ -100,7 +100,7 @@ impl PipeServer {
                 PIPE_BUFFER_SIZE,
                 PIPE_BUFFER_SIZE,
                 0,
-                &security.attributes,
+                security.attributes(),
             )
         };
         if handle == INVALID_HANDLE_VALUE {
@@ -108,7 +108,7 @@ impl PipeServer {
         }
 
         Ok(Self {
-            handle: OwnedHandle(handle),
+            handle: OwnedHandle::new(handle),
             name,
             startup_timeout,
             io_timeout,
@@ -123,7 +123,7 @@ impl PipeServer {
         self.connect()?;
 
         let mut actual_pid = 0;
-        if unsafe { GetNamedPipeClientProcessId(self.handle.0, &mut actual_pid) } == 0 {
+        if unsafe { GetNamedPipeClientProcessId(self.handle.raw(), &mut actual_pid) } == 0 {
             return Err(last_error("GetNamedPipeClientProcessId"));
         }
         if actual_pid != expected_pid {
@@ -181,9 +181,9 @@ impl PipeServer {
     fn connect(&self) -> Result<(), BrokerError> {
         let event = create_event()?;
         let mut overlapped = Box::new(unsafe { zeroed::<OVERLAPPED>() });
-        overlapped.hEvent = event.0;
+        overlapped.hEvent = event.raw();
 
-        let connected = unsafe { ConnectNamedPipe(self.handle.0, overlapped.as_mut()) };
+        let connected = unsafe { ConnectNamedPipe(self.handle.raw(), overlapped.as_mut()) };
         if connected != 0 {
             return Ok(());
         }
@@ -197,7 +197,7 @@ impl PipeServer {
         }
 
         wait_for_overlapped(
-            self.handle.0,
+            self.handle.raw(),
             overlapped,
             event,
             self.startup_timeout,
@@ -239,12 +239,12 @@ impl PipeServer {
     fn read_once(&self, buffer: &mut [u8], timeout: Duration) -> Result<usize, BrokerError> {
         let event = create_event()?;
         let mut overlapped = Box::new(unsafe { zeroed::<OVERLAPPED>() });
-        overlapped.hEvent = event.0;
+        overlapped.hEvent = event.raw();
         let length = u32::try_from(buffer.len()).expect("control frame is bounded by 1 MiB");
 
         let started = unsafe {
             ReadFile(
-                self.handle.0,
+                self.handle.raw(),
                 buffer.as_mut_ptr().cast(),
                 length,
                 null_mut(),
@@ -259,7 +259,7 @@ impl PipeServer {
         }
 
         wait_for_overlapped(
-            self.handle.0,
+            self.handle.raw(),
             overlapped,
             event,
             timeout,
@@ -289,12 +289,12 @@ impl PipeServer {
     fn write_once(&self, buffer: &[u8], timeout: Duration) -> Result<usize, BrokerError> {
         let event = create_event()?;
         let mut overlapped = Box::new(unsafe { zeroed::<OVERLAPPED>() });
-        overlapped.hEvent = event.0;
+        overlapped.hEvent = event.raw();
         let length = u32::try_from(buffer.len()).expect("control frame is bounded by 1 MiB");
 
         let started = unsafe {
             WriteFile(
-                self.handle.0,
+                self.handle.raw(),
                 buffer.as_ptr().cast(),
                 length,
                 null_mut(),
@@ -309,7 +309,7 @@ impl PipeServer {
         }
 
         wait_for_overlapped(
-            self.handle.0,
+            self.handle.raw(),
             overlapped,
             event,
             timeout,
@@ -323,115 +323,9 @@ impl PipeServer {
 impl Drop for PipeServer {
     fn drop(&mut self) {
         unsafe {
-            DisconnectNamedPipe(self.handle.0);
+            DisconnectNamedPipe(self.handle.raw());
         }
     }
-}
-
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
-
-struct PipeSecurity {
-    descriptor: *mut c_void,
-    attributes: SECURITY_ATTRIBUTES,
-}
-
-impl PipeSecurity {
-    fn for_current_user() -> Result<Self, BrokerError> {
-        let sid = current_user_sid()?;
-        let sddl = wide(&format!("D:(A;;GA;;;SY)(A;;GA;;;{sid})"));
-        let mut descriptor = null_mut();
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                null_mut(),
-            )
-        } == 0
-        {
-            return Err(last_error(
-                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-            ));
-        }
-
-        Ok(Self {
-            descriptor,
-            attributes: SECURITY_ATTRIBUTES {
-                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: descriptor,
-                bInheritHandle: 0,
-            },
-        })
-    }
-}
-
-impl Drop for PipeSecurity {
-    fn drop(&mut self) {
-        if !self.descriptor.is_null() {
-            unsafe {
-                LocalFree(self.descriptor);
-            }
-        }
-    }
-}
-
-fn current_user_sid() -> Result<String, BrokerError> {
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(last_error("OpenProcessToken"));
-    }
-    let token = OwnedHandle(token);
-
-    let mut required = 0;
-    unsafe {
-        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required);
-    }
-    if required == 0 {
-        return Err(last_error("GetTokenInformation(size)"));
-    }
-
-    let words = (required as usize).div_ceil(size_of::<usize>());
-    let mut buffer = vec![0_usize; words];
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            (buffer.len() * size_of::<usize>()) as u32,
-            &mut required,
-        )
-    } == 0
-    {
-        return Err(last_error("GetTokenInformation(TokenUser)"));
-    }
-
-    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    let mut sid_text = null_mut();
-    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_text) } == 0 {
-        return Err(last_error("ConvertSidToStringSidW"));
-    }
-
-    let mut length = 0;
-    unsafe {
-        while *sid_text.add(length) != 0 {
-            length += 1;
-        }
-    }
-    let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_text, length) });
-    unsafe {
-        LocalFree(sid_text.cast());
-    }
-    Ok(sid)
 }
 
 fn create_event() -> Result<OwnedHandle, BrokerError> {
@@ -439,7 +333,7 @@ fn create_event() -> Result<OwnedHandle, BrokerError> {
     if handle.is_null() {
         Err(last_error("CreateEventW"))
     } else {
-        Ok(OwnedHandle(handle))
+        Ok(OwnedHandle::new(handle))
     }
 }
 
@@ -451,12 +345,13 @@ fn wait_for_overlapped(
     timeout_error: BrokerError,
     result_operation: &'static str,
 ) -> Result<u32, BrokerError> {
-    let wait = unsafe { WaitForSingleObject(event.0, timeout_ms(timeout)) };
+    let wait = unsafe { WaitForSingleObject(event.raw(), timeout_ms(timeout)) };
     if wait == WAIT_TIMEOUT {
         unsafe {
             CancelIoEx(handle, overlapped.as_mut());
         }
-        if unsafe { WaitForSingleObject(event.0, timeout_ms(CANCELLATION_GRACE)) } != WAIT_OBJECT_0
+        if unsafe { WaitForSingleObject(event.raw(), timeout_ms(CANCELLATION_GRACE)) }
+            != WAIT_OBJECT_0
         {
             std::mem::forget(overlapped);
             std::mem::forget(event);

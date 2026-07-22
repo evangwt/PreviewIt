@@ -1,9 +1,12 @@
 pub mod handles;
+pub mod instance;
 pub mod pipe;
 pub mod session;
 pub mod supervisor;
+mod windows_security;
 
 pub use handles::{HandleError, ReadOnlyDocument, RemoteHandle, current_process_handle_count};
+pub use instance::{InstanceContender, InstanceError, InstanceLease, InstanceRole};
 pub use pipe::{BrokerError, PipeServer};
 pub use session::{PreviewRequest, SessionEffect, SessionEvent, SessionReducer, SessionState};
 pub use supervisor::{
