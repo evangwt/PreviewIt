@@ -25,7 +25,7 @@ QuickLook 的常驻进程同时承担全局热键、Shell 选择、WPF UI、插�
 
 `PreviewIt` 作为 QuickLook 的 GPLv3 派生实现演进，允许直接复用 QuickLook.Common、WPF Viewer/Legacy Host、插件加载契约和必要的 Windows 原生适配；新 Rust 代码和分发产物保持 GPLv3 兼容。
 
-实现以 QuickLook 最新稳定版 `4.5.0`（提交 `b13df028f3cce1f84792f7043b57bf5cea3a3e4c`）为源码基线，不直接跟随持续变化的 `master`。本机已安装的 `4.1.1`（提交 `55a069046f7e7d441c8978474fa887ca4ed0e499`）及其 17 个用户插件程序集保留为向后兼容样本；`master` 只作为发布后关键修复的候选来源，每项修复都需单独验证后引入。
+实现以 QuickLook 最新稳定版 `4.5.0`（提交 `b13df028f3cce1f84792f7043b57bf5cea3a3e4c`）为源码基线，不直接跟随持续变化的 `master`。该提交已连同 GPLv3 来源记录导入仓库，且完整 solution 可在不修改上游源码的前提下构建。本机已安装的 `4.1.1`（提交 `55a069046f7e7d441c8978474fa887ca4ed0e499`）及其 17 个用户插件程序集保留为向后兼容样本；`master` 只作为发布后关键修复的候选来源，每项修复都需单独验证后引入。
 
 长期采用演进式混合内核：常驻的 Rust Broker 是控制面，负责单实例、全局键盘钩子、前台窗口识别、当前选择获取、预览会话、路由策略、缓存索引、Named Pipe IPC 和子进程监督；统一 Viewer Shell 是显示面，负责窗口、主题、DPI、导航和用户可见状态；Legacy Host、Renderer Worker 和系统预览处理器构成受监管执行面。
 
@@ -67,6 +67,8 @@ Renderer 使用自适应受监管 Worker：每个 Renderer 包和安全边界使
 
 旧的 `message|path|options` 字符串协议不作为新边界。新协议使用当前用户专属 Named Pipe 上按长度分帧的 Protobuf，至少包含协议版本、`request_id`、来源窗口类型、主题、DPI、首选尺寸、能力和错误类型。协议按 `major.minor + capabilities` 协商：主版本不兼容时拒绝连接，次版本通过能力协商向后兼容。
 
+Foundation 已验证协议 `0.1` 的最小子集：Protobuf envelope 使用 4-byte little-endian 长度前缀，单个控制帧最大 1 MiB，Rust 与 `net462` 保持编码和错误行为一致。`read-handle-v0` 作为显式 capability 协商；超出该子集的 Viewer、Renderer 和路由消息仍须在后续 Issue 中按真实调用路径扩展。
+
 请求状态按 `Idle -> Resolving -> Preparing -> Rendering -> Ready -> Closing` 管理。新请求取消旧请求；所有异步结果必须携带 `request_id`，过期结果丢弃。
 
 渲染结果支持三个形态：`DocumentModel` 承载有界、版本化的语义内容，`SharedSurface` 通过共享内存或共享图形资源承载栅格、视频和 GPU 输出，`ExternalWindow` 用于 Legacy Host、系统组件和复杂交互内容。第一阶段不把跨进程任意 HWND 嵌入作为统一方案。
@@ -78,6 +80,8 @@ Renderer 使用自适应受监管 Worker：每个 Renderer 包和安全边界使
 新插件通过 manifest 声明 ID、协议版本、优先级、扩展名/MIME、架构和能力。Broker 先用声明完成粗路由，再对少数候选执行探测，避免每次选择都串行调用全部插件。
 
 Renderer 使用 Job Object 管理，分别设置启动、探测、首帧、总渲染和取消回收超时；安装目录只读，Named Pipe 限制到当前用户 SID，并验证连接进程身份。Job Object 只负责生命周期和资源治理，不被视为安全沙箱；第三方 Renderer 还需受限令牌，并在兼容时使用 AppContainer。路径校验、Shell Namespace 路径处理和外部程序启动规则集中在 Broker，不由各个 Renderer 自行解释。
+
+Foundation 已证明最小 Windows 边界可行：local-only pipe 的 DACL 只允许当前 token 用户与 SYSTEM，Broker 在读取协议前核对已启动子进程的 PID；Broker 以只读权限打开文件，把 non-inheritable same-access handle 复制到该子进程，不提供路径回退。一个 Worker 由一个带 `KILL_ON_JOB_CLOSE` 的 Job Object 管理，超时、崩溃、挂起和过期结果不会拖垮 Broker；这证明生命周期机制，不把 Job Object 提升为安全沙箱。
 
 Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本及输出参数为键的有界、可丢弃缓存。网络位置、临时文件、加密文件和隐私敏感内容默认不持久缓存；Renderer 不能拥有权威缓存状态。
 
@@ -106,11 +110,11 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 
 ### 可推进范围
 
-- 以 QuickLook `4.5.0` 固定提交导入派生实现，记录来源、许可证和后续补丁边界。
+- 继续以已导入、可复现构建的 QuickLook `4.5.0` 固定提交为兼容基线；后续 `master` 补丁保持逐项来源记录和独立验证。
 - 建立现有行为基线：热键、Shell 选择、窗口焦点、DPI、插件和失败恢复。
 - 验证 Rust Broker 能在不改变用户路径的情况下接管单实例、热键和选择获取。
 - 把现有 Native32/WoW64 helper 收拢为由 Broker 监督的 x86 Dialog Adapter，并验证 32 位文件对话框选择、超时和异常退出恢复。
-- 定义并测试 Preview Protocol 的请求、取消、错误和版本兼容行为。
+- 从已验证的协议 `0.1` framing、版本协商、`request_id` 和 `read-handle-v0` 边界继续扩展请求、取消、错误和版本兼容行为。
 - 把现有插件加载和 WPF Viewer 逐步收拢为 Legacy Host 边界。
 - 以图片、文本和压缩包为第一批 Rust Renderer 候选，保留系统预览器和旧插件作为回退。
 - 建立 Broker 管理的缓存、Renderer 信任分层、内部 v0 SDK 和兼容测试套件；公共 v1 在内置 Renderer 积累真实证据后再发布。
@@ -118,21 +122,23 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 ### Issues
 
 - [ ] `.cs/issues/2026/07/20/open-quicklook-behavior-baseline/index.md`：固定空格到预览、Shell 选择和插件内容三条主路径；补齐运行时兼容矩阵后关闭。
-- [ ] 需要创建 Feature：Rust Broker、Shell Resolver 与 x86 Dialog Adapter 边界。
-- [ ] 需要创建 Feature：跨语言 Preview Protocol。
+- [x] `.cs/issues/2026/07/22/closed-preview-foundation-vertical-slice.md`：导入并构建固定基线，验证 x64 Rust/.NET 协议、身份、只读句柄与单 Worker 故障恢复边界。
+- [ ] 下一项需要创建 Feature：Rust Broker 单实例与请求状态机。
+- [ ] 需要创建 Feature：Shell Resolver 与受限 x86 Dialog Adapter 边界。
 - [ ] 需要创建 Refactor：Legacy .NET/WPF Plugin Host 边界。
-- [ ] 需要创建 Feature：Renderer Supervisor 与故障恢复。
+- [ ] 需要创建 Feature：Renderer registry、manifest、supervisor policy 与 cache。
+- [ ] 需要创建 Feature：系统 `IPreviewHandler` 路由。
 - [ ] 需要创建 Feature：Rust 图片/文本 Renderer MVP。
-- [ ] 需要创建 Feature：系统 `IPreviewHandler` 集成。
+- [ ] 需要创建 Feature：公开 Renderer SDK v1 readiness。
 
 ### 暂停或废弃
 
-- 暂无。Epic 尚未进入实现阶段。
+- 暂无。Foundation vertical slice 已完成，生产路径尚未接管。
 
 ### 剩余阻碍
 
-- 当前工作区尚未导入 QuickLook `4.5.0` 源码；导入时必须保持上游来源和 GPLv3 许可信息，并把选择性引入的 `master` 修复记录为独立补丁。
-- Protobuf 已确认为控制协议编码，但 v0 消息字段、尺寸上限、超时默认值和 .NET/Rust 句柄传递仍需最小原型验证。
+- Rust Broker 的生产单实例规则、外部命令入口和完整请求状态转换尚未设计；Foundation 只验证了一个 Worker 的监督与过期结果拒绝。
+- Shell Resolver、x86 Dialog Adapter、Viewer/Legacy Host 和 Renderer 的生产进程边界仍需按后续 Issue 逐项验证，不能从 WorkerProbe 直接外推。
 
 ## 暂不推进范围
 
@@ -165,6 +171,7 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 - QuickLook 的系统集成、用户界面、旧插件和新 Renderer 的稳定职责边界。
 - 旧插件通过 Legacy Host 保持兼容的长期策略。
 - Preview Protocol 的稳定术语、会话状态和错误恢复规则。
+- 已验证的协议 framing、当前用户 pipe 身份验证、只读句柄所有权和 Worker 回收边界。
 - 哪些格式由系统预览器、旧插件或 Rust Renderer 负责。
 
 ## 关闭回写

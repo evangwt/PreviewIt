@@ -2,7 +2,7 @@
 kind: issue
 title: "Preview foundation vertical slice"
 type: feature
-status: open
+status: closed
 created: 2026-07-22
 epic: ".cs/epics/2026/07/20/rust-hybrid-preview-architecture/spec.md"
 ---
@@ -70,8 +70,9 @@ The workflow YAML and PowerShell gate parse locally, and the official WiX `wix31
 
 Execution confirms the Epic assumptions about `net462` Protobuf use, authenticated named pipes, read-only duplicate handles, and Job Object recovery. The Epic spec therefore does not need a corrective update.
 
-## Close-out handoff
+## 关闭结论
 
-- Keep this issue, the behavior-baseline Explore, and the architecture Epic open until the user explicitly authorizes closure.
-- On closure, graduate the validated protocol `0.1`, current-user pipe boundary, read-handle ownership, and single-worker Job Object recovery conclusions into the Epic spec.
-- Do not claim ARM64 support. Future ARM64 work remains a separately evaluated Epic concern.
+- 关闭判断：目标范围已经完成。固定的 QuickLook `4.5.0` 基线可在当前环境无源码修改构建，x64 Rust Broker 与 `net462` WorkerProbe 的最小跨进程边界已通过正反向测试。
+- 验证摘要：本地 foundation gate 全部通过，包含 14 个 Rust 测试、4 个 .NET 测试、100 次只读句柄传递、150 ms 取消期限下的 Job Object 回收，以及 crash、hang 和 stale `request_id` 恢复。Broker 与 WorkerProbe 均为 x64，未添加 ARM64 target 或产物。
+- 回写位置：协议 `0.1` 的 framing/capability 边界、当前用户 pipe 身份验证、只读句柄所有权和单 Worker Job Object 恢复结论已回写所属 Rust 混合预览架构 Epic。
+- 遗留事项：GitHub-hosted workflow 尚未运行，因为分支未推送；这不影响本地 vertical slice 的关闭。行为基线 Explore 和架构 Epic 保持开启，后续工作从 Rust Broker 单实例与请求状态机 Issue 继续。
