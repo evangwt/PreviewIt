@@ -1,0 +1,65 @@
+name: Foundation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install WiX Toolset 3.14.1
+        shell: pwsh
+        run: |
+          $wixRoot = Join-Path $env:RUNNER_TEMP 'wix314'
+          $wixBin = Join-Path $wixRoot 'bin'
+          $archive = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          New-Item -ItemType Directory -Path $wixBin -Force | Out-Null
+          Invoke-WebRequest `
+            'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' `
+            -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $wixBin -Force
+          "WIX=$wixRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WixInstallPath=$wixBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WixToolPath=$wixBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WixExtDir=$wixBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WixTasksPath=$wixBin\WixTasks.dll" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WixTargetsPath=$wixBin\wix.targets" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install pinned x64 Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.0-x86_64-pc-windows-msvc `
+            --profile minimal `
+            --component clippy `
+            --component rustfmt `
+            --target x86_64-pc-windows-msvc
+          rustup default 1.97.0-x86_64-pc-windows-msvc
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust/target
+          key: ${{ runner.os }}-x64-cargo-${{ hashFiles('src/rust/Cargo.lock') }}
+
+      - name: Restore NuGet cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-x64-nuget-${{ hashFiles('**/packages.lock.json') }}
+
+      - name: Run foundation gate
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/test-foundation.ps1

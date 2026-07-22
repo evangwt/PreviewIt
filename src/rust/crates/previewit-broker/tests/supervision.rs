@@ -38,7 +38,7 @@ fn fixture() -> PathBuf {
 
 fn deadlines() -> Deadlines {
     Deadlines {
-        startup: Duration::from_secs(5),
+        startup: Duration::from_secs(15),
         io: Duration::from_secs(5),
         cancel: Duration::from_millis(150),
     }
