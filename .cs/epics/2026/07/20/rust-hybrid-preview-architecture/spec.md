@@ -123,7 +123,7 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 
 - [ ] `.cs/issues/2026/07/20/open-quicklook-behavior-baseline/index.md`：固定空格到预览、Shell 选择和插件内容三条主路径；补齐运行时兼容矩阵后关闭。
 - [x] `.cs/issues/2026/07/22/closed-preview-foundation-vertical-slice.md`：导入并构建固定基线，验证 x64 Rust/.NET 协议、身份、只读句柄与单 Worker 故障恢复边界。
-- [ ] 下一项需要创建 Feature：Rust Broker 单实例与请求状态机。
+- [ ] `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`：在每个交互式会话中选出一个 x64 Broker，转发有界 command，并验证 `request_id` 状态机与 stale/cancel 规则。
 - [ ] 需要创建 Feature：Shell Resolver 与受限 x86 Dialog Adapter 边界。
 - [ ] 需要创建 Refactor：Legacy .NET/WPF Plugin Host 边界。
 - [ ] 需要创建 Feature：Renderer registry、manifest、supervisor policy 与 cache。
