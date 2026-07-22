@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/previewit-protocol"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.97"

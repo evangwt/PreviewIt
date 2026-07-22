@@ -1,0 +1,43 @@
+syntax = "proto3";
+package previewit.preview.v0;
+
+message Envelope {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string request_id = 3;
+  oneof payload {
+    Hello hello = 10;
+    HelloAck hello_ack = 11;
+    OpenDocument open_document = 12;
+    Cancel cancel = 13;
+    Result result = 14;
+    PreviewError error = 15;
+  }
+}
+
+message Hello {
+  string component_id = 1;
+  repeated string capabilities = 2;
+}
+
+message HelloAck {
+  repeated string accepted_capabilities = 1;
+}
+
+message OpenDocument {
+  fixed64 duplicated_handle = 1;
+  uint64 size = 2;
+  string display_name = 3;
+}
+
+message Cancel {}
+
+message Result {
+  string status = 1;
+  bytes payload = 2;
+}
+
+message PreviewError {
+  string code = 1;
+  string message = 2;
+}

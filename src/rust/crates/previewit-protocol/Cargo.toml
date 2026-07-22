@@ -1,0 +1,15 @@
+[package]
+name = "previewit-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+prost = "0.14.4"
+thiserror = "2.0.19"
+
+[build-dependencies]
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
