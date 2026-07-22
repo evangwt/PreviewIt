@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/previewit-protocol"]
+members = ["crates/previewit-broker", "crates/previewit-protocol"]
 
 [workspace.package]
 edition = "2024"
