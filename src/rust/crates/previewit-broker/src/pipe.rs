@@ -74,11 +74,19 @@ pub enum BrokerError {
 pub struct PipeServer {
     handle: OwnedHandle,
     name: String,
-    timeout: Duration,
+    startup_timeout: Duration,
+    io_timeout: Duration,
 }
 
 impl PipeServer {
     pub fn create(timeout: Duration) -> Result<Self, BrokerError> {
+        Self::create_with_timeouts(timeout, timeout)
+    }
+
+    pub fn create_with_timeouts(
+        startup_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<Self, BrokerError> {
         let name = format!("PreviewIt-{}", Uuid::new_v4().simple());
         let full_name = wide(&format!(r"\\.\pipe\{name}"));
         let security = PipeSecurity::for_current_user()?;
@@ -102,7 +110,8 @@ impl PipeServer {
         Ok(Self {
             handle: OwnedHandle(handle),
             name,
-            timeout,
+            startup_timeout,
+            io_timeout,
         })
     }
 
@@ -124,8 +133,7 @@ impl PipeServer {
             });
         }
 
-        let payload = self.read_frame()?;
-        let envelope = Envelope::decode(payload.as_slice())?;
+        let envelope = self.receive_envelope()?;
         if envelope.protocol_major != PROTOCOL_MAJOR {
             return Err(BrokerError::ProtocolMajorMismatch {
                 major: envelope.protocol_major,
@@ -158,7 +166,16 @@ impl PipeServer {
             request_id: "handshake-1".to_owned(),
             payload: Some(envelope::Payload::HelloAck(hello_ack)),
         };
+        self.send_envelope(&envelope)
+    }
+
+    pub fn send_envelope(&self, envelope: &Envelope) -> Result<(), BrokerError> {
         self.write_frame(&envelope.encode_to_vec())
+    }
+
+    pub fn receive_envelope(&self) -> Result<Envelope, BrokerError> {
+        let payload = self.read_frame()?;
+        Ok(Envelope::decode(payload.as_slice())?)
     }
 
     fn connect(&self) -> Result<(), BrokerError> {
@@ -183,7 +200,7 @@ impl PipeServer {
             self.handle.0,
             overlapped,
             event,
-            self.timeout,
+            self.startup_timeout,
             BrokerError::StartupTimeout,
             "GetOverlappedResult(ConnectNamedPipe)",
         )?;
@@ -191,7 +208,7 @@ impl PipeServer {
     }
 
     fn read_frame(&self) -> Result<Vec<u8>, BrokerError> {
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.io_timeout;
         let mut length_bytes = [0_u8; 4];
         self.read_exact(&mut length_bytes, deadline)?;
         let declared = u32::from_le_bytes(length_bytes) as usize;
@@ -254,7 +271,7 @@ impl PipeServer {
 
     fn write_frame(&self, payload: &[u8]) -> Result<(), BrokerError> {
         let frame = encode_frame(payload)?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.io_timeout;
         let mut offset = 0;
         while offset < frame.len() {
             let timeout = deadline

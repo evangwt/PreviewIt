@@ -1,8 +1,11 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Google.Protobuf;
+using Microsoft.Win32.SafeHandles;
 using PreviewIt.Protocol;
 using Previewit.Preview.V0;
 
@@ -56,15 +59,137 @@ namespace PreviewIt.WorkerProbe
                     {
                         throw new InvalidDataException("Broker returned an invalid HelloAck.");
                     }
-                }
 
-                return 0;
+                    switch (options.Mode)
+                    {
+                        case WorkerMode.Handshake:
+                            return 0;
+                        case WorkerMode.Crash:
+                            return 42;
+                        case WorkerMode.Hang:
+                            System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+                            return 1;
+                        case WorkerMode.Handles:
+                            RunRequests(pipe, stale: false);
+                            return 0;
+                        case WorkerMode.Stale:
+                            RunRequests(pipe, stale: true);
+                            return 0;
+                        default:
+                            throw new InvalidDataException("Unknown worker mode.");
+                    }
+                }
             }
             catch (Exception error)
             {
                 Console.Error.WriteLine(error.Message);
                 return 1;
             }
+        }
+
+        private static void RunRequests(NamedPipeClientStream pipe, bool stale)
+        {
+            Envelope previousResult = null;
+            while (true)
+            {
+                var request = Envelope.Parser.ParseFrom(ReadFrame(pipe));
+                switch (request.PayloadCase)
+                {
+                    case Envelope.PayloadOneofCase.Cancel:
+                        return;
+                    case Envelope.PayloadOneofCase.OpenDocument:
+                        if (stale && previousResult != null)
+                        {
+                            WriteWithTimeout(pipe, FramedProtocol.Encode(previousResult.ToByteArray()));
+                        }
+
+                        var (result, writeError) = ReadDocument(request);
+                        WriteWithTimeout(pipe, FramedProtocol.Encode(result.ToByteArray()));
+                        WriteWithTimeout(pipe, FramedProtocol.Encode(writeError.ToByteArray()));
+                        previousResult = result.Clone();
+                        break;
+                    default:
+                        throw new InvalidDataException("Worker received an unsupported request.");
+                }
+            }
+        }
+
+        private static (Envelope Result, Envelope WriteError) ReadDocument(Envelope request)
+        {
+            var document = request.OpenDocument;
+            if (document.Size > int.MaxValue)
+            {
+                throw new InvalidDataException("The foundation worker only accepts int-sized fixtures.");
+            }
+
+            var rawHandle = new IntPtr(unchecked((long)document.DuplicatedHandle));
+            using (var safeHandle = new SafeFileHandle(rawHandle, ownsHandle: true))
+            {
+                var payload = ReadFromHandle(safeHandle, (int)document.Size);
+                var result = new Envelope
+                {
+                    ProtocolMajor = 0,
+                    ProtocolMinor = 1,
+                    RequestId = request.RequestId,
+                    Result = new Result
+                    {
+                        Status = "read-ok",
+                        Payload = ByteString.CopyFrom(payload),
+                    },
+                };
+
+                var writeError = 0;
+                var writeSucceeded = TryWriteOneByte(safeHandle, out writeError);
+                var error = new Envelope
+                {
+                    ProtocolMajor = 0,
+                    ProtocolMinor = 1,
+                    RequestId = request.RequestId,
+                    Error = new PreviewError
+                    {
+                        Code = writeSucceeded ? "write-succeeded" : "write-denied",
+                        Message = writeError.ToString(CultureInfo.InvariantCulture),
+                    },
+                };
+                return (result, error);
+            }
+        }
+
+        private static byte[] ReadFromHandle(SafeFileHandle handle, int length)
+        {
+            var payload = new byte[length];
+            var offset = 0;
+            while (offset < payload.Length)
+            {
+                var chunk = new byte[Math.Min(payload.Length - offset, 64 * 1024)];
+                uint read;
+                if (!ReadFile(
+                    handle,
+                    chunk,
+                    (uint)chunk.Length,
+                    out read,
+                    IntPtr.Zero))
+                {
+                    throw new IOException($"ReadFile failed: {Marshal.GetLastWin32Error()}");
+                }
+
+                if (read == 0)
+                {
+                    throw new EndOfStreamException("Duplicated handle ended before the advertised size.");
+                }
+                Buffer.BlockCopy(chunk, 0, payload, offset, checked((int)read));
+                offset += checked((int)read);
+            }
+            return payload;
+        }
+
+        private static bool TryWriteOneByte(SafeFileHandle handle, out int error)
+        {
+            var byteToWrite = new byte[] { 0x58 };
+            uint written;
+            var succeeded = WriteFile(handle, byteToWrite, 1, out written, IntPtr.Zero);
+            error = succeeded ? 0 : Marshal.GetLastWin32Error();
+            return succeeded && written == 1;
         }
 
         private static byte[] ReadFrame(Stream stream)
@@ -119,11 +244,12 @@ namespace PreviewIt.WorkerProbe
 
         private sealed class Options
         {
-            private Options(string pipeName, uint protocolMajor, bool sendOversizedFrame)
+            private Options(string pipeName, uint protocolMajor, bool sendOversizedFrame, WorkerMode mode)
             {
                 PipeName = pipeName;
                 ProtocolMajor = protocolMajor;
                 SendOversizedFrame = sendOversizedFrame;
+                Mode = mode;
             }
 
             public string PipeName { get; }
@@ -132,11 +258,14 @@ namespace PreviewIt.WorkerProbe
 
             public bool SendOversizedFrame { get; }
 
+            public WorkerMode Mode { get; }
+
             public static Options Parse(string[] args)
             {
                 string pipeName = null;
                 uint protocolMajor = 0;
                 var oversized = false;
+                var mode = WorkerMode.Handshake;
 
                 for (var index = 0; index < args.Length; index++)
                 {
@@ -151,6 +280,9 @@ namespace PreviewIt.WorkerProbe
                         case "--oversized":
                             oversized = true;
                             break;
+                        case "--mode" when index + 1 < args.Length:
+                            mode = ParseMode(args[++index]);
+                            break;
                         default:
                             throw new ArgumentException($"Unknown or incomplete argument: {args[index]}");
                     }
@@ -163,8 +295,46 @@ namespace PreviewIt.WorkerProbe
                     throw new ArgumentException("--pipe must be a bare named-pipe name.");
                 }
 
-                return new Options(pipeName, protocolMajor, oversized);
+                return new Options(pipeName, protocolMajor, oversized, mode);
+            }
+
+            private static WorkerMode ParseMode(string value)
+            {
+                switch (value)
+                {
+                    case "handshake": return WorkerMode.Handshake;
+                    case "handles": return WorkerMode.Handles;
+                    case "crash": return WorkerMode.Crash;
+                    case "hang": return WorkerMode.Hang;
+                    case "stale": return WorkerMode.Stale;
+                    default: throw new ArgumentException($"Unknown worker mode: {value}");
+                }
             }
         }
+
+        private enum WorkerMode
+        {
+            Handshake,
+            Handles,
+            Crash,
+            Hang,
+            Stale,
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadFile(
+            SafeFileHandle hFile,
+            [Out] byte[] lpBuffer,
+            uint nNumberOfBytesToRead,
+            out uint lpNumberOfBytesRead,
+            IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool WriteFile(
+            SafeFileHandle hFile,
+            byte[] lpBuffer,
+            uint nNumberOfBytesToWrite,
+            out uint lpNumberOfBytesWritten,
+            IntPtr lpOverlapped);
     }
 }
