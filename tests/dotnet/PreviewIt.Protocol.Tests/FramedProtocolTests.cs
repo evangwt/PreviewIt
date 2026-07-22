@@ -57,5 +57,48 @@ namespace PreviewIt.Protocol.Tests
             Assert.AreEqual(1, parsed.Hello.Capabilities.Count);
             Assert.AreEqual("read-handle-v0", parsed.Hello.Capabilities[0]);
         }
+
+        [TestMethod]
+        public void BrokerControlRequestRoundTrips()
+        {
+            const string Path = @"C:\fixtures\preview.txt";
+            var request = new BrokerControlRequest
+            {
+                ProtocolMajor = 0,
+                ProtocolMinor = 1,
+                CommandId = "command-1",
+                OpenPath = new OpenPath
+                {
+                    PathUtf16Le = ByteString.CopyFrom(Encoding.Unicode.GetBytes(Path))
+                }
+            };
+
+            var parsed = BrokerControlRequest.Parser.ParseFrom(request.ToByteArray());
+
+            Assert.AreEqual(0U, parsed.ProtocolMajor);
+            Assert.AreEqual(1U, parsed.ProtocolMinor);
+            Assert.AreEqual("command-1", parsed.CommandId);
+            Assert.AreEqual(BrokerControlRequest.CommandOneofCase.OpenPath, parsed.CommandCase);
+            Assert.AreEqual(Path, Encoding.Unicode.GetString(parsed.OpenPath.PathUtf16Le.ToByteArray()));
+        }
+
+        [TestMethod]
+        public void BrokerControlResponseRoundTrips()
+        {
+            var response = new BrokerControlResponse
+            {
+                ProtocolMajor = 0,
+                ProtocolMinor = 1,
+                CommandId = "command-1",
+                Accepted = true,
+                RequestId = "request-1"
+            };
+
+            var parsed = BrokerControlResponse.Parser.ParseFrom(response.ToByteArray());
+
+            Assert.IsTrue(parsed.Accepted);
+            Assert.AreEqual("request-1", parsed.RequestId);
+            Assert.AreEqual(string.Empty, parsed.ErrorCode);
+        }
     }
 }

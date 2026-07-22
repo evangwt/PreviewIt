@@ -46,3 +46,43 @@ fn protobuf_envelope_round_trips() {
     assert_eq!(hello.component_id, "dotnet-probe");
     assert_eq!(hello.capabilities, ["read-handle-v0"]);
 }
+
+#[test]
+fn protobuf_broker_control_round_trips() {
+    use previewit_protocol::v0::{
+        BrokerControlRequest, BrokerControlResponse, OpenPath, broker_control_request,
+    };
+
+    let path = r"C:\fixtures\preview.txt";
+    let path_utf16le: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let request = BrokerControlRequest {
+        protocol_major: 0,
+        protocol_minor: 1,
+        command_id: "command-1".into(),
+        command: Some(broker_control_request::Command::OpenPath(OpenPath {
+            path_utf16le: path_utf16le.clone(),
+        })),
+    };
+
+    let parsed = BrokerControlRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(parsed.protocol_major, 0);
+    assert_eq!(parsed.protocol_minor, 1);
+    assert_eq!(parsed.command_id, "command-1");
+    let Some(broker_control_request::Command::OpenPath(open_path)) = parsed.command else {
+        panic!("expected OpenPath command");
+    };
+    assert_eq!(open_path.path_utf16le, path_utf16le);
+
+    let response = BrokerControlResponse {
+        protocol_major: 0,
+        protocol_minor: 1,
+        command_id: "command-1".into(),
+        accepted: true,
+        request_id: "request-1".into(),
+        error_code: String::new(),
+    };
+    let parsed = BrokerControlResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+    assert!(parsed.accepted);
+    assert_eq!(parsed.request_id, "request-1");
+    assert!(parsed.error_code.is_empty());
+}

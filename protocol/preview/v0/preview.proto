@@ -41,3 +41,28 @@ message PreviewError {
   string code = 1;
   string message = 2;
 }
+
+message BrokerControlRequest {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string command_id = 3;
+  oneof command {
+    OpenPath open_path = 10;
+    ClosePreview close_preview = 11;
+  }
+}
+
+message OpenPath {
+  bytes path_utf16le = 1;
+}
+
+message ClosePreview {}
+
+message BrokerControlResponse {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string command_id = 3;
+  bool accepted = 4;
+  string request_id = 5;
+  string error_code = 6;
+}
