@@ -92,24 +92,7 @@ impl CommandRouter {
     }
 
     pub(crate) fn handle_event(&mut self, event: SessionEvent) -> Vec<SessionEffect> {
-        let mut pending: VecDeque<_> = self.reducer.handle(event).into();
-        let mut effects = Vec::new();
-        while let Some(effect) = pending.pop_front() {
-            let cleanup_id = match &effect {
-                SessionEffect::Cancel(request_id) | SessionEffect::Cleanup(request_id) => {
-                    Some(request_id.clone())
-                }
-                _ => None,
-            };
-            effects.push(effect);
-            if let Some(request_id) = cleanup_id {
-                pending.extend(
-                    self.reducer
-                        .handle(SessionEvent::CleanupComplete(request_id)),
-                );
-            }
-        }
-        effects
+        self.reducer.handle(event)
     }
 
     fn remember(&mut self, command_id: CommandId, ack: CommandAck) {

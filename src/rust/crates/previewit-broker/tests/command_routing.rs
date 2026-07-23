@@ -57,8 +57,9 @@ fn absolute_missing_path_enters_resolving_without_filesystem_io() {
 
 #[test]
 fn close_is_accepted_and_idempotent() {
+    let path = absolute_path("open");
     let mut router = router_with_ids(&["request-1"], 8);
-    router.route(open("command-open", absolute_path("open")));
+    router.route(open("command-open", path.clone()));
 
     let first = router.route(close("command-close-1"));
     let second = router.route(close("command-close-2"));
@@ -72,7 +73,16 @@ fn close_is_accepted_and_idempotent() {
     assert!(matches!(second.ack, CommandAck::CloseAccepted { .. }));
     assert_eq!(second.disposition, RouteDisposition::Routed);
     assert!(second.effects.is_empty());
-    assert_eq!(router.state(), &SessionState::Idle);
+    assert_eq!(
+        router.state(),
+        &SessionState::Closing {
+            old: PreviewRequest {
+                request_id: "request-1".into(),
+                path,
+            },
+            next: None,
+        }
+    );
 }
 
 #[test]
@@ -114,7 +124,7 @@ fn duplicate_cache_evicts_the_oldest_command() {
 }
 
 #[test]
-fn rapid_replacement_cleans_up_each_old_request_and_keeps_the_latest() {
+fn rapid_replacement_stays_closing_and_keeps_only_the_latest_pending_request() {
     let path = absolute_path("replacement");
     let mut router = router_with_ids(&["request-1", "request-2", "request-3"], 8);
 
@@ -124,31 +134,25 @@ fn rapid_replacement_cleans_up_each_old_request_and_keeps_the_latest() {
 
     assert_eq!(
         second.effects,
-        vec![
-            SessionEffect::Cancel("request-1".into()),
-            SessionEffect::BeginResolve(PreviewRequest {
-                request_id: "request-2".into(),
-                path: path.clone(),
-            }),
-        ]
+        vec![SessionEffect::Cancel("request-1".into())]
     );
     assert_eq!(
         latest.effects,
-        vec![
-            SessionEffect::Cancel("request-2".into()),
-            SessionEffect::BeginResolve(PreviewRequest {
-                request_id: "request-3".into(),
-                path: path.clone(),
-            }),
-        ]
+        vec![SessionEffect::Superseded("request-2".into())]
     );
     assert_eq!(second.disposition, RouteDisposition::Routed);
     assert_eq!(latest.disposition, RouteDisposition::Routed);
     assert_eq!(
         router.state(),
-        &SessionState::Resolving(PreviewRequest {
-            request_id: "request-3".into(),
-            path,
-        })
+        &SessionState::Closing {
+            old: PreviewRequest {
+                request_id: "request-1".into(),
+                path: path.clone(),
+            },
+            next: Some(PreviewRequest {
+                request_id: "request-3".into(),
+                path,
+            }),
+        }
     );
 }

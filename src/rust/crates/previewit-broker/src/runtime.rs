@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
     BrokerCommandError, BrokerCommandServer, BrokerEvent, CommandAck, CommandRouter, EventSink,
@@ -51,8 +51,8 @@ impl BrokerRuntime {
                 .events
                 .emit(&BrokerEvent::CommandDuplicate { command_id }),
         }
-        self.emit_effects(&result.effects);
         self.emit_transition(before);
+        self.drive_effects(result.effects);
         result.ack
     }
 
@@ -74,8 +74,8 @@ impl BrokerRuntime {
                 reason: "reported-failure",
             });
         }
-        self.emit_effects(&effects);
         self.emit_transition(before);
+        self.drive_effects(effects.clone());
         effects
     }
 
@@ -145,20 +145,34 @@ impl BrokerRuntime {
         }
     }
 
-    fn emit_effects(&self, effects: &[SessionEffect]) {
-        for effect in effects {
-            if let SessionEffect::StaleIgnored { expected, actual } = effect {
-                self.events.emit(&BrokerEvent::StaleIgnored {
-                    expected: expected.clone(),
-                    actual: actual.clone(),
-                });
+    fn drive_effects(&mut self, initial: Vec<SessionEffect>) {
+        let mut pending: VecDeque<_> = initial.into();
+        while let Some(effect) = pending.pop_front() {
+            match effect {
+                SessionEffect::Cancel(request_id) | SessionEffect::Cleanup(request_id) => {
+                    let before = StateSnapshot::capture(self.router.state());
+                    pending.extend(
+                        self.router
+                            .handle_event(SessionEvent::CleanupComplete(request_id)),
+                    );
+                    self.emit_transition(before);
+                }
+                SessionEffect::StaleIgnored { expected, actual } => {
+                    self.events
+                        .emit(&BrokerEvent::StaleIgnored { expected, actual });
+                }
+                SessionEffect::BeginResolve(_)
+                | SessionEffect::BeginPrepare(_)
+                | SessionEffect::BeginRender(_)
+                | SessionEffect::PublishReady(_)
+                | SessionEffect::Superseded(_) => {}
             }
         }
     }
 
     fn emit_transition(&self, before: StateSnapshot) {
         let after = StateSnapshot::capture(self.router.state());
-        if before.phase != after.phase {
+        if before != after {
             self.events.emit(&BrokerEvent::SessionTransition {
                 from: before.phase,
                 to: after.phase,
@@ -174,6 +188,7 @@ impl Drop for BrokerRuntime {
     }
 }
 
+#[derive(PartialEq, Eq)]
 struct StateSnapshot {
     phase: SessionPhase,
     request_id: Option<String>,

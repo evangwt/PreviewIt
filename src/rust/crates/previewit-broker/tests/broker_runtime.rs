@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use previewit_broker::{
     BrokerCommand, BrokerCommandServer, BrokerEvent, BrokerRuntime, CommandId, CommandRouter,
-    EventSink, InstanceLease, InstanceRole, SessionEvent, ValidatedCommand,
+    EventSink, InstanceLease, InstanceRole, SessionEvent, SessionPhase, ValidatedCommand,
 };
 use uuid::Uuid;
 
@@ -51,7 +51,11 @@ fn test_runtime(events: RecordingEventSink) -> (BrokerRuntime, String) {
         panic!("unique runtime lease must elect primary");
     };
     let server = BrokerCommandServer::create(lease.pipe_name(), TIMEOUT, TIMEOUT).unwrap();
-    let mut request_ids = VecDeque::from(["request-1".to_owned()]);
+    let mut request_ids = VecDeque::from([
+        "request-1".to_owned(),
+        "request-2".to_owned(),
+        "request-3".to_owned(),
+    ]);
     let router =
         CommandRouter::with_id_source(8, move || request_ids.pop_front().expect("request id"));
     let runtime = BrokerRuntime::with_router(lease, server, router, Arc::new(events.clone()));
@@ -90,7 +94,42 @@ fn current_failure_emits_failure_before_the_resulting_transition() {
     events.clear();
     runtime.handle_event(SessionEvent::Failed("request-1".into()));
 
-    assert_eq!(events.names(), ["session-failed", "session-transition"]);
+    assert_eq!(
+        events.names(),
+        ["session-failed", "session-transition", "session-transition"]
+    );
+}
+
+#[test]
+fn replacement_emits_each_transition_while_runtime_drives_cleanup() {
+    let events = RecordingEventSink::default();
+    let (mut runtime, _) = test_runtime(events.clone());
+    let path = PathBuf::from(r"C:\definitely-missing-previewit\runtime.txt");
+
+    runtime.handle(validated_open("command-1", path.clone()));
+    events.clear();
+    runtime.handle(validated_open("command-2", path));
+
+    let recorded = events.events.lock().unwrap().clone();
+    assert!(matches!(
+        recorded.as_slice(),
+        [
+            BrokerEvent::CommandAccepted {
+                request_id: Some(next),
+                ..
+            },
+            BrokerEvent::SessionTransition {
+                from: SessionPhase::Resolving,
+                to: SessionPhase::Closing,
+                request_id: Some(old),
+            },
+            BrokerEvent::SessionTransition {
+                from: SessionPhase::Closing,
+                to: SessionPhase::Resolving,
+                request_id: Some(promoted),
+            },
+        ] if next == "request-2" && old == "request-1" && promoted == "request-2"
+    ));
 }
 
 #[test]
