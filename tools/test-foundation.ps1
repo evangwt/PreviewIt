@@ -25,6 +25,8 @@ Invoke-Checked 'clippy' { cargo clippy --manifest-path src/rust/Cargo.toml --wor
 # The Rust integration suites execute the Release x64 worker directly. A clean
 # checkout therefore has to build it before `cargo test --workspace`.
 Invoke-Checked 'worker-build' { dotnet build src/dotnet/PreviewIt.WorkerProbe/PreviewIt.WorkerProbe.csproj -c Release }
+Invoke-Checked 'broker-build' { cargo build --manifest-path src/rust/Cargo.toml -p previewit-broker }
+Invoke-Checked 'broker-single-instance' { cargo test --manifest-path src/rust/Cargo.toml -p previewit-broker --test broker_single_instance -- --test-threads=1 }
 Invoke-Checked 'rust-tests' { cargo test --manifest-path src/rust/Cargo.toml --workspace }
 Invoke-Checked 'dotnet-tests' { dotnet test tests/dotnet/PreviewIt.Protocol.Tests/PreviewIt.Protocol.Tests.csproj -c Release }
 

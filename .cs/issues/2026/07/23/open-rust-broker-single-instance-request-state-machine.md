@@ -161,17 +161,25 @@ second Broker process
 
 ## 验证
 
-- `cargo test --manifest-path src/rust/Cargo.toml -p previewit-broker --test instance_lease`
-- `cargo test --manifest-path src/rust/Cargo.toml -p previewit-broker --test request_state_machine`
-- `cargo fmt --manifest-path src/rust/Cargo.toml --all -- --check`
-- `cargo clippy --manifest-path src/rust/Cargo.toml --workspace --all-targets -- -D warnings`
-- `pwsh -NoProfile -File tools/test-foundation.ps1`
-- 复核 Broker/WorkerProbe PE 为 x64，且 `rust-toolchain.toml` 仅包含 `x86_64-pc-windows-msvc`。
+- 完整 gate：`pwsh -NoProfile -File tools/test-foundation.ps1` 退出 `0`。实际出现 `QUICKLOOK_BASELINE_OK=b13df028f3cce1f84792f7043b57bf5cea3a3e4c`、`LEGACY_BUILD_OK`、`FOUNDATION_STEP=broker-single-instance`、`FOUNDATION_GATE_OK`；rustfmt、workspace Clippy、Release x64 Worker build、显式 Broker build、legacy build 和 .NET build 均成功。
+- Rust workspace：Broker 46 个测试与 protocol 5 个测试全部通过。Broker 明细为 command raw/deadline 6、command transport 10、single-instance process 4、router 6、Worker handshake 5、handle transfer 2、instance lease 4、request reducer 6、supervision/stale 3；无失败、忽略或遗留子进程。
+- .NET protocol parity：`dotnet test tests/dotnet/PreviewIt.Protocol.Tests/PreviewIt.Protocol.Tests.csproj -c Release` 共 6 个测试全部通过；Broker control 与 Worker envelope 的 `0.1` round trip 保持一致。
+- 竞态稳定性：`full_pending_queue_returns_stable_rejection` 重复 10/10；truncated-frame 提前断管竞态重复 100/100；十进程选主和 crash takeover 场景重复 10/10。每轮都只有一个 primary 存活、九个 secondary 收到 accepted ack 并成功退出，kill primary 后新进程取得同一 session lease。
+- 输入/超时证据：wrong major、oversized/truncated frame、malformed Protobuf、缺失/超长 command ID、奇数 UTF-16LE、embedded NUL、超长路径分别返回稳定码；容量 8 的 pending queue 对第 9 个等待命令返回 `queue-full`；无 endpoint 返回 `primary-not-ready`，response read 与 write timeout 有稳定 code，错误和进程输出不包含完整路径。
+- 状态/路由证据：6 个 reducer 测试覆盖 happy path、latest-wins replacement、Close、Failed cleanup 和 stale result；6 个 router 测试覆盖绝对且存在的路径、相对/缺失路径、Close 幂等、duplicate replay、FIFO eviction 和即时 cleanup 后只保留最新请求。
+- x64-only：VS `dumpbin /headers src/rust/target/debug/previewit-broker.exe` 输出 `8664 machine (x64)`；`rustup target list --installed` 只输出 `x86_64-pc-windows-msvc`；`rg -n "aarch64|ARM64" rust-toolchain.toml src/rust .github/workflows/foundation.yml tools/test-foundation.ps1` 无匹配。WorkerProbe 继续固定 `<Platforms>x64</Platforms>`、`<PlatformTarget>x64</PlatformTarget>`、`<Prefer32Bit>false</Prefer32Bit>`。
 
 ## 执行记录
 
 - 设计阶段：基于 QuickLook `4.5.0` 的 Mutex/pipe 实现、foundation vertical slice 的 pipe/supervisor 证据、PowerToys `appMutex.h`/Runner 和 Tauri Windows single-instance 插件完成方案比较。
-- 尚未实现代码或新增协议字段；本 Issue 关闭前必须补充实际命令、测试输出和偏差说明。
+- Task 1（`2a38db2 feat: define broker control protocol`）：先让 Rust/.NET parity 测试因缺少 `BrokerControlRequest`、`OpenPath`、`BrokerControlResponse` 符号失败，再加入独立于 Worker `Envelope` 的最小 schema；GREEN 为 Rust protocol 5/5、.NET protocol 6/6。
+- Task 2（`34b13c5 feat: add broker request state machine`）：先因缺少 session module/API 进入 RED，再实现纯 `SessionReducer`；6/6 覆盖完整 phase、replacement、Close、cleanup 和 stale event，状态只由 `handle(event)` 改变。
+- Task 3（`ad2fd10 feat: elect one broker per user session`）：先因缺少 `InstanceLease`/`InstanceRole` 进入 RED，再实现 session-local Mutex、contender takeover 与 current-user + SYSTEM security；lease 4/4、既有 Worker handshake 5/5。通用 HANDLE 不声明 `Send`，避免破坏 Win32 Mutex 的线程所有权。
+- Task 4（`d8a6dde feat: add broker command channel`）：正向 RED 是 unresolved `BrokerCommandClient`/`BrokerCommandServer`；随后逐轮用缺失 error variant、通用 `transport-error`、accepted oversized ID、queue Broken Pipe 和 blocking `FlushFileBuffers` 证明负向/queue/deadline 行为。最终以局部 `PipeHandle: Send` 在线程间转移 overlapped Named Pipe，保留通用 `OwnedHandle` 的非 `Send`；command unit 6/6、transport 10/10、Worker handshake 5/5。
+- Task 5（`5f48783 feat: run single-instance broker control loop`）：router RED 是缺少 `CommandRouter`；process RED 证明 probe stub 让十个实例全部退出且错误地对 invalid/primary-not-ready 返回成功。最终 router 6/6、真实进程 4/4；CLI 在选主前验证，primary 路由自身命令并常驻，secondary 只转发一次，connect deadline 后只重查 Mutex。
+- Task 6（本提交 `test: gate broker instance state machine`）：在 Worker build 后、general Rust tests 前加入显式 `broker-build` 与串行 `broker-single-instance` gate；workflow 已调用同一脚本，因此无需修改 `.github/workflows/foundation.yml`。
+- 小设计偏差：命令响应不调用不可取消的 `FlushFileBuffers`，因为真实 RED 证明不读响应的 client 会让 server 越过 I/O deadline 并最终以 Broken Pipe 失败；改为以 overlapped `WriteFile` 完成为交付边界，正向 round trip 与 non-reading client deadline 同时通过。listener 使用容量 8 的 `sync_channel`，合法请求交入 bounded channel 后立即创建下一 pipe instance；queue 满时在当前连接直接拒绝，因此开放连接数仍受容量加 listener 限制。
+- 范围保持：没有接入 Shell、热键、x86 Dialog Adapter、Viewer、Renderer、installer 或 updater；没有 ARM64 target、条件编译、产物或声明。Issue 继续保持 `open`，behavior-baseline Explore 继续保持 `open`，architecture Epic 继续保持 `draft`，等待用户明确授权关闭与毕业回写。
 
 ## 关闭回写
 
