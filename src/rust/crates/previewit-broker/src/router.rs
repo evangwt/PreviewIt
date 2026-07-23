@@ -63,7 +63,7 @@ impl CommandRouter {
         let (ack, effects) = match command {
             BrokerCommand::Open(path) => {
                 let request_id = (self.request_ids)();
-                let effects = self.handle(SessionEvent::Open(PreviewRequest {
+                let effects = self.handle_event(SessionEvent::Open(PreviewRequest {
                     request_id: request_id.clone(),
                     path,
                 }));
@@ -79,7 +79,7 @@ impl CommandRouter {
                 CommandAck::CloseAccepted {
                     command_id: command_id.clone(),
                 },
-                self.handle(SessionEvent::Close),
+                self.handle_event(SessionEvent::Close),
             ),
         };
 
@@ -91,7 +91,7 @@ impl CommandRouter {
         }
     }
 
-    fn handle(&mut self, event: SessionEvent) -> Vec<SessionEffect> {
+    pub(crate) fn handle_event(&mut self, event: SessionEvent) -> Vec<SessionEffect> {
         let mut pending: VecDeque<_> = self.reducer.handle(event).into();
         let mut effects = Vec::new();
         while let Some(effect) = pending.pop_front() {

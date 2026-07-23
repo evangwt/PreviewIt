@@ -2,15 +2,18 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use previewit_broker::{
     BrokerCommandClient, BrokerCommandError, BrokerCommandServer, BrokerControlContract,
-    CommandRouter, InstanceLease, InstanceRole,
+    BrokerEvent, BrokerRuntime, CommandAck, EventSink, InstanceLease, InstanceRole,
+    InstanceRoleName, StderrEventSink,
 };
 use previewit_protocol::v0::{
     BrokerControlRequest, BrokerControlResponse, ClosePreview, OpenPath, broker_control_request,
 };
+use previewit_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use uuid::Uuid;
 
 const PRODUCT_ID: &str = "PreviewIt.Broker";
@@ -32,9 +35,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let events: Arc<dyn EventSink> = Arc::new(StderrEventSink);
     match InstanceLease::elect(&product_id()) {
-        Ok(InstanceRole::Primary(lease)) => run_primary(lease, command),
-        Ok(InstanceRole::Secondary(contender)) => run_secondary(contender, command),
+        Ok(InstanceRole::Primary(lease)) => run_primary(lease, command, events),
+        Ok(InstanceRole::Secondary(contender)) => {
+            events.emit(&BrokerEvent::InstanceElected {
+                role: InstanceRoleName::Secondary,
+            });
+            run_secondary(contender, command, events)
+        }
         Err(_) => {
             eprintln!("role=unknown accepted=false error_code=instance-error");
             ExitCode::FAILURE
@@ -65,8 +74,8 @@ fn control_request(command: StartupCommand) -> BrokerControlRequest {
         StartupCommand::Close => broker_control_request::Command::ClosePreview(ClosePreview {}),
     };
     BrokerControlRequest {
-        protocol_major: 0,
-        protocol_minor: 1,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
         command_id: Uuid::new_v4().to_string(),
         command: Some(command),
     }
@@ -83,58 +92,51 @@ fn product_id() -> String {
 }
 
 fn run_primary(
-    lease: previewit_broker::InstanceLease,
+    lease: InstanceLease,
     startup_command: Option<BrokerControlRequest>,
+    events: Arc<dyn EventSink>,
 ) -> ExitCode {
-    let server = match BrokerCommandServer::create(lease.pipe_name(), STARTUP_TIMEOUT, IO_TIMEOUT) {
+    let server = match BrokerCommandServer::create_with_event_sink(
+        lease.pipe_name(),
+        STARTUP_TIMEOUT,
+        IO_TIMEOUT,
+        events.clone(),
+    ) {
         Ok(server) => server,
         Err(error) => {
             print_error("primary", error.code());
             return ExitCode::FAILURE;
         }
     };
-    let mut router = CommandRouter::new();
+    let mut runtime = BrokerRuntime::new(lease, server, events.clone());
 
     if let Some(request) = startup_command {
         let ack = match BrokerControlContract::decode_request(request) {
-            Ok(command) => router.route(command).ack,
-            Err(rejection) => rejection.into_ack(),
+            Ok(command) => runtime.handle(command),
+            Err(rejection) => {
+                events.emit(&BrokerEvent::CommandRejected {
+                    command_id: rejection.safe_command_id().map(ToOwned::to_owned),
+                    reason: rejection.code().as_str(),
+                });
+                rejection.into_ack()
+            }
         };
-        let response = BrokerControlContract::encode_response(&ack);
-        print_response("primary", &response);
+        print_ack("primary", &ack);
     } else {
         print_ready_primary();
     }
 
-    loop {
-        match server.receive() {
-            Ok(pending) => {
-                let result = router.route(pending.command().clone());
-                if let Err(error) = pending.respond(result.ack) {
-                    eprintln!(
-                        "role=primary event=response-error error_code={}",
-                        error.code()
-                    );
-                }
-            }
-            Err(BrokerCommandError::Transport(previewit_broker::BrokerError::StartupTimeout)) => {}
-            Err(BrokerCommandError::ListenerStopped) => {
-                print_error("primary", "listener-stopped");
-                return ExitCode::FAILURE;
-            }
-            Err(error) => {
-                eprintln!(
-                    "role=primary event=command-rejected error_code={}",
-                    error.code()
-                );
-            }
-        }
+    if let Err(error) = runtime.run() {
+        print_error("primary", error.code());
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }
 
 fn run_secondary(
     mut contender: previewit_broker::InstanceContender,
     command: Option<BrokerControlRequest>,
+    events: Arc<dyn EventSink>,
 ) -> ExitCode {
     let Some(command) = command else {
         print_simple_ack("secondary", true, "");
@@ -143,12 +145,11 @@ fn run_secondary(
 
     match BrokerCommandClient::send(contender.pipe_name(), &command, STARTUP_TIMEOUT, IO_TIMEOUT) {
         Ok(ack) => {
-            let response = BrokerControlContract::encode_response(&ack);
-            print_response("secondary", &response);
-            accepted_exit(response.accepted)
+            print_ack("secondary", &ack);
+            accepted_exit(&ack)
         }
         Err(BrokerCommandError::PrimaryNotReady) => match contender.try_take_over() {
-            Ok(Some(lease)) => run_primary(lease, Some(command)),
+            Ok(Some(lease)) => run_primary(lease, Some(command), events),
             Ok(None) => {
                 print_error("secondary", "primary-not-ready");
                 ExitCode::FAILURE
@@ -165,12 +166,20 @@ fn run_secondary(
     }
 }
 
-fn accepted_exit(accepted: bool) -> ExitCode {
-    if accepted {
+fn accepted_exit(ack: &CommandAck) -> ExitCode {
+    if matches!(
+        ack,
+        CommandAck::OpenAccepted { .. } | CommandAck::CloseAccepted { .. }
+    ) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn print_ack(role: &str, ack: &CommandAck) {
+    let response = BrokerControlContract::encode_response(ack);
+    print_response(role, &response);
 }
 
 fn print_response(role: &str, response: &BrokerControlResponse) {

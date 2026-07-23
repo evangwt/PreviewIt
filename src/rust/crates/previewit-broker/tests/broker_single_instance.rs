@@ -150,6 +150,9 @@ fn ten_processes_elect_one_primary_and_crash_takeover_replaces_it() {
     let primary_index = running[0];
     let primary_text = processes[primary_index].kill_and_collect();
     assert!(primary_text.contains("role=primary"));
+    assert!(primary_text.contains("event=instance-elected"));
+    assert!(primary_text.contains("event=endpoint-started"));
+    assert!(primary_text.contains("event=command-accepted"));
 
     let close_arguments = [OsStr::new("--close")];
     let mut replacement = ManagedChild::spawn(&suffix, &close_arguments);
@@ -167,6 +170,8 @@ fn ten_processes_elect_one_primary_and_crash_takeover_replaces_it() {
     let replacement_text = replacement.kill_and_collect();
     assert!(replacement_text.contains("role=primary"));
     assert!(replacement_text.contains("accepted=true"));
+    assert!(replacement_text.contains("event=instance-elected"));
+    assert!(replacement_text.contains("event=endpoint-started"));
 }
 
 #[test]

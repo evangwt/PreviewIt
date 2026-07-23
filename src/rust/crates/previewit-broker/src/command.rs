@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,11 +18,12 @@ use tokio::time::{sleep, timeout};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 
 use crate::control::InvalidCommandResponse;
+use crate::event::NoopEventSink;
 use crate::pipe::{BrokerError, read_frame, write_frame};
 use crate::windows_security::{CurrentUserSecurity, WindowsSecurityError};
 use crate::{
-    BrokerCommand, BrokerControlContract, CommandAck, CommandId, CommandRejectionCode, ExpectedAck,
-    ValidatedCommand,
+    BrokerCommand, BrokerControlContract, BrokerEvent, CommandAck, CommandId, CommandRejectionCode,
+    EventSink, ExpectedAck, ValidatedCommand,
 };
 
 const MAX_QUEUED_COMMANDS: usize = 8;
@@ -122,6 +124,15 @@ impl BrokerCommandServer {
         startup_timeout: Duration,
         io_timeout: Duration,
     ) -> Result<Self, BrokerCommandError> {
+        Self::create_with_event_sink(name, startup_timeout, io_timeout, Arc::new(NoopEventSink))
+    }
+
+    pub fn create_with_event_sink(
+        name: &str,
+        startup_timeout: Duration,
+        io_timeout: Duration,
+        events: Arc<dyn EventSink>,
+    ) -> Result<Self, BrokerCommandError> {
         let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_COMMANDS);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -135,6 +146,7 @@ impl BrokerCommandServer {
                     sender,
                     shutdown_receiver,
                     ready_sender,
+                    events,
                 );
             })
             .map_err(|source| transport_error("spawn command endpoint", source))?;
@@ -216,6 +228,7 @@ fn endpoint_thread_main(
     sender: SyncSender<PendingCommand>,
     shutdown: oneshot::Receiver<()>,
     ready: SyncSender<Result<(), BrokerCommandError>>,
+    events: Arc<dyn EventSink>,
 ) {
     let runtime = match Builder::new_current_thread()
         .enable_io()
@@ -251,7 +264,10 @@ fn endpoint_thread_main(
             return;
         }
 
-        run_endpoint(name, listener, security, io_timeout, sender, shutdown).await;
+        run_endpoint(
+            name, listener, security, io_timeout, sender, shutdown, events,
+        )
+        .await;
     });
 }
 
@@ -262,6 +278,7 @@ async fn run_endpoint(
     io_timeout: Duration,
     sender: SyncSender<PendingCommand>,
     mut shutdown: oneshot::Receiver<()>,
+    events: Arc<dyn EventSink>,
 ) {
     let decoders = std::sync::Arc::new(Semaphore::new(MAX_DECODING_CONNECTIONS));
     let mut connections = JoinSet::new();
@@ -290,12 +307,24 @@ async fn run_endpoint(
                 match decoders.clone().try_acquire_owned() {
                     Ok(permit) => {
                         let connection_sender = sender.clone();
+                        let connection_events = events.clone();
                         connections.spawn(async move {
-                            handle_connection(connected, permit, connection_sender, io_timeout).await;
+                            handle_connection(
+                                connected,
+                                permit,
+                                connection_sender,
+                                io_timeout,
+                                connection_events,
+                            )
+                            .await;
                         });
                     }
                     Err(_) => {
                         let mut connected = connected;
+                        events.emit(&BrokerEvent::CommandRejected {
+                            command_id: None,
+                            reason: CommandRejectionCode::PrimaryBusy.as_str(),
+                        });
                         let ack = CommandAck::Rejected {
                             command_id: None,
                             reason: CommandRejectionCode::PrimaryBusy,
@@ -317,10 +346,15 @@ async fn handle_connection(
     decoder: tokio::sync::OwnedSemaphorePermit,
     sender: SyncSender<PendingCommand>,
     io_timeout: Duration,
+    events: Arc<dyn EventSink>,
 ) {
     let payload = match read_frame(&mut pipe, io_timeout).await {
         Ok(payload) => payload,
         Err(BrokerError::ControlFrameTooLarge { .. }) => {
+            events.emit(&BrokerEvent::CommandRejected {
+                command_id: None,
+                reason: CommandRejectionCode::FrameTooLarge.as_str(),
+            });
             let ack = CommandAck::Rejected {
                 command_id: None,
                 reason: CommandRejectionCode::FrameTooLarge,
@@ -333,6 +367,10 @@ async fn handle_connection(
     let wire_request = match BrokerControlRequest::decode(payload.as_slice()) {
         Ok(request) => request,
         Err(_) => {
+            events.emit(&BrokerEvent::CommandRejected {
+                command_id: None,
+                reason: CommandRejectionCode::InvalidProtobuf.as_str(),
+            });
             let ack = CommandAck::Rejected {
                 command_id: None,
                 reason: CommandRejectionCode::InvalidProtobuf,
@@ -344,6 +382,10 @@ async fn handle_connection(
     let command = match BrokerControlContract::decode_request(wire_request) {
         Ok(command) => command,
         Err(rejection) => {
+            events.emit(&BrokerEvent::CommandRejected {
+                command_id: rejection.safe_command_id().map(ToOwned::to_owned),
+                reason: rejection.code().as_str(),
+            });
             let _ = write_ack(&mut pipe, &rejection.into_ack(), io_timeout).await;
             return;
         }
@@ -360,13 +402,21 @@ async fn handle_connection(
             }
         }
         Err(TrySendError::Full(_)) => {
+            events.emit(&BrokerEvent::CommandQueueFull {
+                command_id: command_id.as_str().to_owned(),
+            });
             let ack = CommandAck::Rejected {
                 command_id: Some(command_id),
                 reason: CommandRejectionCode::QueueFull,
             };
             let _ = write_ack(&mut pipe, &ack, io_timeout).await;
         }
-        Err(TrySendError::Disconnected(_)) => {}
+        Err(TrySendError::Disconnected(_)) => {
+            events.emit(&BrokerEvent::CommandRejected {
+                command_id: Some(command_id.as_str().to_owned()),
+                reason: "listener-stopped",
+            });
+        }
     }
 }
 

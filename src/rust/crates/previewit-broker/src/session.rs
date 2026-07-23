@@ -19,6 +19,53 @@ pub enum SessionState {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPhase {
+    Idle,
+    Resolving,
+    Preparing,
+    Rendering,
+    Ready,
+    Closing,
+}
+
+impl SessionPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Resolving => "resolving",
+            Self::Preparing => "preparing",
+            Self::Rendering => "rendering",
+            Self::Ready => "ready",
+            Self::Closing => "closing",
+        }
+    }
+}
+
+impl SessionState {
+    pub fn phase(&self) -> SessionPhase {
+        match self {
+            Self::Idle => SessionPhase::Idle,
+            Self::Resolving(_) => SessionPhase::Resolving,
+            Self::Preparing(_) => SessionPhase::Preparing,
+            Self::Rendering(_) => SessionPhase::Rendering,
+            Self::Ready(_) => SessionPhase::Ready,
+            Self::Closing { .. } => SessionPhase::Closing,
+        }
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Idle => None,
+            Self::Resolving(request)
+            | Self::Preparing(request)
+            | Self::Rendering(request)
+            | Self::Ready(request) => Some(&request.request_id),
+            Self::Closing { old, .. } => Some(&old.request_id),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
     Open(PreviewRequest),
