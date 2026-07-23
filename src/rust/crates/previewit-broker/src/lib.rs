@@ -27,5 +27,3 @@ pub use session::{
 pub use supervisor::{
     Deadlines, DocumentOutcome, ShutdownOutcome, SupervisorError, WorkerMode, WorkerSupervisor,
 };
-#[doc(hidden)]
-pub use windows_security::current_user_sid_for_inspection;

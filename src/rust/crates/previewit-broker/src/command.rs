@@ -1,5 +1,4 @@
 use std::io;
-use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
@@ -121,7 +120,6 @@ pub struct BrokerCommandServer {
     shutdown: Option<oneshot::Sender<()>>,
     endpoint_thread: Option<JoinHandle<()>>,
     receive_timeout: Duration,
-    inspection_handle: usize,
 }
 
 impl BrokerCommandServer {
@@ -158,12 +156,11 @@ impl BrokerCommandServer {
             .map_err(|source| transport_error("spawn command endpoint", source))?;
 
         match ready_receiver.recv() {
-            Ok(Ok(inspection_handle)) => Ok(Self {
+            Ok(Ok(())) => Ok(Self {
                 receiver,
                 shutdown: Some(shutdown),
                 endpoint_thread: Some(endpoint_thread),
                 receive_timeout: startup_timeout,
-                inspection_handle,
             }),
             Ok(Err(error)) => {
                 let _ = endpoint_thread.join();
@@ -183,13 +180,6 @@ impl BrokerCommandServer {
                 RecvTimeoutError::Timeout => BrokerError::StartupTimeout.into(),
                 RecvTimeoutError::Disconnected => BrokerCommandError::ListenerStopped,
             })
-    }
-
-    #[doc(hidden)]
-    /// Returns a non-owning value for the initial listener handle.
-    /// It is only valid before the first client connects and before shutdown.
-    pub fn inspection_handle(&self) -> usize {
-        self.inspection_handle
     }
 
     pub fn shutdown(&mut self) -> Result<(), BrokerCommandError> {
@@ -241,7 +231,7 @@ fn endpoint_thread_main(
     io_timeout: Duration,
     sender: SyncSender<PendingCommand>,
     shutdown: oneshot::Receiver<()>,
-    ready: SyncSender<Result<usize, BrokerCommandError>>,
+    ready: SyncSender<Result<(), BrokerCommandError>>,
     events: Arc<dyn EventSink>,
 ) {
     let runtime = match Builder::new_current_thread()
@@ -274,8 +264,7 @@ fn endpoint_thread_main(
                 return;
             }
         };
-        let inspection_handle = listener.as_raw_handle() as usize;
-        if ready.send(Ok(inspection_handle)).is_err() {
+        if ready.send(Ok(())).is_err() {
             return;
         }
 
@@ -584,20 +573,204 @@ fn transport_error(operation: &'static str, source: io::Error) -> BrokerCommandE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::MaybeUninit;
+    use std::ffi::c_void;
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::windows::io::AsRawHandle;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GRANT_ACCESS, GetExplicitEntriesFromAclW, GetSecurityInfo,
+        SE_KERNEL_OBJECT, TRUSTEE_IS_SID,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, PSECURITY_DESCRIPTOR, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, OPEN_EXISTING, ReadFile, WriteFile,
     };
+    use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_REJECT_REMOTE_CLIENTS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const SYSTEM_SID: &str = "S-1-5-18";
+
+    struct LocalAllocation(*mut c_void);
+
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    struct OwnedTestHandle(HANDLE);
+
+    impl Drop for OwnedTestHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct PipeInspection {
+        allowed_sids: Vec<String>,
+        handle_inheritable: bool,
+        rejects_remote_clients: bool,
+    }
+
+    struct InspectedServer {
+        server: NamedPipeServer,
+        _security: CurrentUserSecurity,
+        _runtime: tokio::runtime::Runtime,
+    }
 
     fn test_name(label: &str) -> String {
         format!(
             "PreviewIt.Test.Unit.{label}.{}",
             uuid::Uuid::new_v4().simple()
         )
+    }
+
+    fn inspected_server(name: &str) -> InspectedServer {
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let security = CurrentUserSecurity::new().unwrap();
+        let server = {
+            let _entered = runtime.enter();
+            create_pipe_instance(name, true, &security).unwrap()
+        };
+        InspectedServer {
+            server,
+            _security: security,
+            _runtime: runtime,
+        }
+    }
+
+    fn inspect_command_pipe(handle: HANDLE) -> PipeInspection {
+        let mut handle_flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(handle, &mut handle_flags) },
+            0,
+            "GetHandleInformation failed: {}",
+            io::Error::last_os_error()
+        );
+
+        let mut pipe_flags = 0;
+        assert_ne!(
+            unsafe {
+                GetNamedPipeInfo(handle, &mut pipe_flags, null_mut(), null_mut(), null_mut())
+            },
+            0,
+            "GetNamedPipeInfo failed: {}",
+            io::Error::last_os_error()
+        );
+
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "GetSecurityInfo failed: {status}");
+        let _descriptor = LocalAllocation(descriptor);
+        assert!(!dacl.is_null(), "command pipe must have a DACL");
+
+        let mut entry_count = 0;
+        let mut entries = null_mut();
+        let status = unsafe { GetExplicitEntriesFromAclW(dacl, &mut entry_count, &mut entries) };
+        assert_eq!(
+            status, ERROR_SUCCESS,
+            "GetExplicitEntriesFromAclW failed: {status}"
+        );
+        assert!(entry_count > 0, "command pipe DACL must not be empty");
+        assert!(!entries.is_null(), "ACL enumeration returned no entries");
+        let _entries = LocalAllocation(entries.cast());
+        let entries = unsafe { std::slice::from_raw_parts(entries, entry_count as usize) };
+        let mut allowed_sids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            assert_eq!(entry.grfAccessMode, GRANT_ACCESS);
+            assert_eq!(entry.grfInheritance, 0);
+            assert_eq!(entry.Trustee.TrusteeForm, TRUSTEE_IS_SID);
+            allowed_sids.push(sid_to_string(entry.Trustee.ptstrName.cast()));
+        }
+        allowed_sids.sort();
+
+        PipeInspection {
+            allowed_sids,
+            handle_inheritable: handle_flags & HANDLE_FLAG_INHERIT != 0,
+            rejects_remote_clients: pipe_flags & PIPE_REJECT_REMOTE_CLIENTS != 0,
+        }
+    }
+
+    fn current_token_user_sid() -> String {
+        let mut token = null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0,
+            "OpenProcessToken failed: {}",
+            io::Error::last_os_error()
+        );
+        let token = OwnedTestHandle(token);
+
+        let mut required = 0;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required);
+        }
+        assert!(required > 0, "GetTokenInformation returned no size");
+
+        let words = (required as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * size_of::<usize>()) as u32,
+                    &mut required,
+                )
+            },
+            0,
+            "GetTokenInformation failed: {}",
+            io::Error::last_os_error()
+        );
+        let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        sid_to_string(token_user.User.Sid)
+    }
+
+    fn sid_to_string(sid: *mut c_void) -> String {
+        let mut text = null_mut();
+        assert_ne!(
+            unsafe { ConvertSidToStringSidW(sid, &mut text) },
+            0,
+            "ConvertSidToStringSidW failed: {}",
+            io::Error::last_os_error()
+        );
+        let _text = LocalAllocation(text.cast());
+        let length = (0..)
+            .find(|index| unsafe { *text.add(*index) == 0 })
+            .expect("SID string terminator");
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
     }
 
     fn raw_round_trip(name: &str, bytes: &[u8]) -> Vec<u8> {
@@ -708,6 +881,50 @@ mod tests {
                 previewit_protocol::v0::ClosePreview {},
             )),
         }
+    }
+
+    #[test]
+    fn command_pipe_dacl_contains_only_system_and_current_user() {
+        let name = test_name("dacl");
+        let inspected = inspected_server(&name);
+        let inspection = inspect_command_pipe(inspected.server.as_raw_handle().cast());
+        let mut expected = vec![SYSTEM_SID.to_owned(), current_token_user_sid()];
+        expected.sort();
+
+        assert_eq!(inspection.allowed_sids, expected);
+        assert!(!inspection.handle_inheritable);
+    }
+
+    #[test]
+    fn command_pipe_rejects_remote_clients_and_allows_current_user() {
+        let name = test_name("local-only");
+        let inspected = inspected_server(&name);
+        let inspection = inspect_command_pipe(inspected.server.as_raw_handle().cast());
+        assert!(inspection.rejects_remote_clients);
+        drop(inspected);
+
+        let server =
+            BrokerCommandServer::create(&name, Duration::from_secs(2), Duration::from_secs(2))
+                .unwrap();
+        let client_name = name.clone();
+        let client = thread::spawn(move || {
+            BrokerCommandClient::send(
+                &client_name,
+                &close_request("command-security"),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+        });
+        let pending = server.receive().unwrap();
+        let command_id = pending.command().command_id().clone();
+        pending
+            .respond(CommandAck::CloseAccepted { command_id })
+            .unwrap();
+
+        assert!(matches!(
+            client.join().unwrap().unwrap(),
+            CommandAck::CloseAccepted { .. }
+        ));
     }
 
     #[test]
