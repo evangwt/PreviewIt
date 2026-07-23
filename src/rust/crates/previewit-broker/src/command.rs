@@ -30,9 +30,13 @@ use crate::{
 const MAX_QUEUED_COMMANDS: usize = 8;
 const MAX_ACTIVE_COMMANDS: usize = 1;
 const MAX_DECODING_CONNECTIONS: usize = 4;
+const ADMISSION_RESERVE: usize = 1;
 const LISTENER_RESERVE: usize = 1;
-const MAX_PIPE_INSTANCES: usize =
-    MAX_QUEUED_COMMANDS + MAX_ACTIVE_COMMANDS + MAX_DECODING_CONNECTIONS + LISTENER_RESERVE;
+const MAX_PIPE_INSTANCES: usize = MAX_QUEUED_COMMANDS
+    + MAX_ACTIVE_COMMANDS
+    + MAX_DECODING_CONNECTIONS
+    + ADMISSION_RESERVE
+    + LISTENER_RESERVE;
 const PIPE_BUFFER_SIZE: u32 = (MAX_CONTROL_FRAME + 4) as u32;
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -312,6 +316,17 @@ async fn run_endpoint(
 
                 let next = match create_pipe_instance(&name, false, &security) {
                     Ok(next) => next,
+                    Err(error) if is_pipe_busy(&error) => {
+                        reject_primary_busy(&mut listener, events.as_ref(), io_timeout).await;
+                        drop(listener);
+                        match create_pipe_instance(&name, false, &security) {
+                            Ok(next) => {
+                                listener = next;
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     Err(_) => break,
                 };
                 let connected = std::mem::replace(&mut listener, next);
@@ -332,15 +347,7 @@ async fn run_endpoint(
                     }
                     Err(_) => {
                         let mut connected = connected;
-                        events.emit(&BrokerEvent::CommandRejected {
-                            command_id: None,
-                            reason: CommandRejectionCode::PrimaryBusy.as_str(),
-                        });
-                        let ack = CommandAck::Rejected {
-                            command_id: None,
-                            reason: CommandRejectionCode::PrimaryBusy,
-                        };
-                        write_ack(&mut connected, &ack, io_timeout).await;
+                        reject_primary_busy(&mut connected, events.as_ref(), io_timeout).await;
                     }
                 }
             }
@@ -350,6 +357,30 @@ async fn run_endpoint(
 
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+}
+
+async fn reject_primary_busy(
+    pipe: &mut NamedPipeServer,
+    events: &dyn EventSink,
+    io_timeout: Duration,
+) {
+    events.emit(&BrokerEvent::CommandRejected {
+        command_id: None,
+        reason: CommandRejectionCode::PrimaryBusy.as_str(),
+    });
+    let ack = CommandAck::Rejected {
+        command_id: None,
+        reason: CommandRejectionCode::PrimaryBusy,
+    };
+    write_ack(pipe, &ack, io_timeout).await;
+}
+
+fn is_pipe_busy(error: &BrokerCommandError) -> bool {
+    matches!(
+        error,
+        BrokerCommandError::Transport(BrokerError::Windows { source, .. })
+            if source.raw_os_error().map(|code| code as u32) == Some(ERROR_PIPE_BUSY)
+    )
 }
 
 async fn handle_connection(
