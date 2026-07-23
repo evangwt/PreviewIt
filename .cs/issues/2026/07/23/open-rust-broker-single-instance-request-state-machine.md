@@ -47,24 +47,27 @@ epic: ".cs/epics/2026/07/20/rust-hybrid-preview-architecture/spec.md"
 
 ## 现状如何工作
 
-当前只有测试调用方直接创建随机 Worker pipe：测试进程启动 WorkerProbe，核对子进程 PID，协商 `0.1`，再把请求交给 `WorkerSupervisor`；没有一个常驻 Broker 接收第二次启动或多个用户请求。
+当前 Broker 已通过 session-scoped Mutex 在控制面初始化前完成选主。主实例创建确定命名的 current-user/SYSTEM Named Pipe，由 listener thread 串行接受、读取并验证一个 Protobuf command，再把合法请求连同 pipe handle 放入容量为 8 的 `sync_channel`；`main` 的单一循环调用 `CommandRouter`/`SessionReducer` 并写回 ack。次实例连接 endpoint、发送一次命令并按 `accepted` 决定退出码；连接超时后只重新检查一次 lease。
 
-QuickLook 的旧路径是：进程启动时先取得 Mutex；首实例启动监听和 UI，次实例把 `Toggle`/`Close` 等字符串命令写入按用户命名的 pipe 后退出；pipe 服务在 UI Dispatcher 上取消上一项 pending operation，再调用 `ViewWindowManager`。旧路径没有统一的 `request_id`、帧上限或 stale response 规则。
+这条路径已经证明并发选主、crash takeover、framing、基础输入校验和 reducer 行为，但 review 发现四个责任分歧。第一，`pipe.rs` 自己管理 Overlapped I/O，超时取消后只保留 `OVERLAPPED`/event，没有同时保留仍被内核引用的 buffer，存在 use-after-free 风险。第二，listener 在完整 decode 后才创建下一 pipe instance，一个慢客户端会占住唯一入口；Drop 只设置停止位，不 join listener。第三，request/response 的版本、ID、shape 和错误码规则分散在 `command.rs`、`router.rs`、`main.rs`，router 还会重新解码路径。第四，router 在唯一状态线程同步执行 `Path::exists()`，而 ack、phase/stale/duplicate/queue 观测没有共同事件模型。
+
+经用户确认，后续统一采用这一语义：`accepted=true` 只表示命令已经进入 Broker session，不表示路径存在或预览成功。UTF-16LE、NUL、长度和 absolute path 属于同步控制边界；存在性、访问权限和文件身份属于 `Resolving`，通过带 `request_id` 的异步成功/失败事件推进状态。
 
 ## 影响范围
 
 - 必须修改：
-  - Broker 启动入口和 Windows instance lease；必须在创建热键、Shell、Viewer 或 Worker 控制面前完成选主。
-  - Broker 控制命令的 Protobuf schema、pipe server/client、确认错误和有限队列。
-  - 会话 reducer 及其与当前 WorkerSupervisor 的边界，使状态所有权集中在 Broker 事件循环而不是 pipe 线程。
-  - Rust Windows 集成测试、测试启动器和日志/指标中的 instance、request、stale、queue-full 结果。
+  - `pipe.rs` 和 command endpoint：用同一套成熟的 Tokio Windows Named Pipe/framing 实现替换手写 Overlapped read/write/cancel，保留现有 DACL、local-only、PID 验证和 deadline。
+  - Broker control contract：集中 wire request/response 转换、protocol version、`command_id`、ack shape 和稳定错误码；队列内部只传 `ValidatedCommand`，不传原始 Protobuf。
+  - endpoint/runtime 生命周期：连接始终由 endpoint task 拥有，通过 reply handle 与唯一状态线程交互；shutdown 必须停止 accept、取消/等待连接任务、join endpoint，最后才释放 lease。
+  - router/runtime：删除同步文件系统访问和重复路径解码；增加统一 `BrokerEvent`，明确 accepted/rejected、busy/full、duplicate、phase、stale、failure 和 shutdown。
 - 需要验证：
-  - 并发启动竞态、主实例初始化期间的次实例重试、主实例崩溃后的重新选主、重复 command 的幂等确认。
-  - pipe 的 current-user + SYSTEM DACL、拒绝远程客户端、1 MiB framing、UTF-16LE/path 边界和协议 major mismatch。
-  - `request_id` 在每个异步事件上的传播；新请求取消旧请求后，旧的 resolve/prepare/render/cancel 完成事件只能产生诊断记录，不能改写当前状态。
-  - foundation 的 x64-only 工具链和 PE 架构检查仍然通过，且不出现 ARM64 target 或产物。
+  - 既有 Worker handshake、handle transfer、supervision、十进程选主、crash takeover 和 duplicate/reducer 行为在 transport 迁移后保持不变。
+  - 单个慢/部分 frame 客户端不能阻断正常 secondary；连接槽耗尽、已解码队列满和 endpoint 尚未创建使用不同稳定语义。
+  - delayed broken pipe 归一化、伪造/串线 response 拒绝、Drop 后同名 endpoint 立即重建，以及 shutdown/lease 的真实顺序。
+  - current-user + SYSTEM DACL 的 ACE、remote-rejection flag、当前用户真实连接、1 MiB framing 和不记录完整路径。
+  - foundation 仍只安装/生成 `x86_64-pc-windows-msvc`，PE 仍为 `8664 machine (x64)`，不引入 ARM64 target、产物或承诺。
 - 仍待调查：
-  - Shell Resolver 如何把窗口选择转换为 `OpenPath` 之前的受控输入，以及 x86 Dialog Adapter 的失败/回收语义。
+  - 后续 Shell Resolver 如何有界地完成存在性、访问权限和文件身份解析，以及 x86 Dialog Adapter 的失败/回收语义；本 Issue 只固定事件和 ack 边界，不提前实现 Resolver。
   - Viewer 的可见错误、进度和 `Ready` 消费方式；本 Issue 只定义 Broker 内部可观察事件和确认响应。
   - 完整的 QuickLook `Toggle`、`RunAndClose`、`Forget`、`Fullscreen`、插件调用等兼容命令何时进入稳定协议。
 
@@ -86,37 +89,37 @@ Pipe 使用 foundation 已验证的 framing、1 MiB 上限、拒绝远程客户�
 
 ### 这次要怎么做
 
-把 Broker 启动拆成两个明确阶段。第一阶段只完成 session-scoped lease：拿到 lease 才能继续初始化；拿不到 lease 的进程连接确定的 command pipe，发送一次 typed command，等待有界 ack 后退出。第二阶段由持有 lease 的主实例启动 pipe listener 和一个会话事件循环；listener 只负责验证 frame、解码和把 command 放进 bounded queue，状态 reducer 是唯一可以改变当前会话的模块。
+保留已经成立的 Mutex 选主、单状态所有者和 reducer，不围绕八个 review finding 各打一层补丁。把根因收敛为四个深模块：共享 framed Named Pipe、Broker control contract、有界 command endpoint、唯一 Broker runtime。旧的手写 Overlapped read/write/cancel 被成熟的 Tokio Windows Named Pipe 完整替换，不保留平行 I/O 路径；Protobuf 只存在于 endpoint 边界，内部只传已经验证的 command 和 ack。
 
-状态 reducer 不直接调用 Windows API 或 Worker。它接收带 `request_id` 的事件，输出新的 phase 和有限 effect；事件循环执行 effect 并把完成事件送回 reducer。这样状态转换可以在不启动进程、不依赖窗口和不伪造时间的情况下测试，同时保留真实 pipe、Mutex 和 Worker 作为集成边界。
+主实例仍在任何其他控制面之前取得 lease，但 runtime 消费 lease 并拥有 endpoint，使 shutdown 顺序成为模块不变量。secondary 仍发送一次命令并等待有界响应；response 必须通过与 request 相同的 contract 验证后才能决定退出码。
 
 ### 功能怎么分工
 
-- **Instance lease**：封装 Mutex 的安全描述符、创建、`WaitForSingleObject(0)` 结果、lease 生命周期和会话命名。它不负责发送命令，也不启动 Broker 子系统；Drop 顺序保证 endpoint 和事件循环先停、lease 最后释放。
-- **Command endpoint**：封装 pipe 安全属性、单连接读取、Protobuf framing、协议版本/长度校验、ack 和 bounded queue。它只把合法 command 交给会话事件循环，不直接改变 `SessionPhase`。
-- **Command router**：把 `OpenPath`、`Close` typed command 映射为 session event；用有界的 `command_id -> ack/request_id` 去重表处理 client 重试，超出容量返回 `queue-full`，不静默丢弃。`OpenPath` 使用 UTF-16LE bytes 保留 Windows `OsString`，边界层拒绝奇数字节、embedded NUL 和超过 Win32 长路径上限的输入。
-- **Session reducer**：唯一拥有 `Idle -> Resolving -> Preparing -> Rendering -> Ready -> Closing` 的状态。活动请求存在时，新请求进入 `Closing { old, next }`，只保留最新 `next` 并为旧请求发出一次 cancel；旧资源 cleanup 完成后才把 `next` 提升到 `Resolving`。任何不匹配当前活动/closing 请求的完成事件只产生 stale 诊断，不产生状态变化。
-- **Effect runner**：在现有 WorkerSupervisor 和未来 Shell/Viewer/Renderer adapter 之间执行 reducer effect。这个 Issue 只接入可测试的最小 fake effect runner 和 Broker 存活检查，不把后续生产组件提前塞进 Broker。
+- **共享 pipe transport**：`pipe.rs` 使用 Tokio `NamedPipeServer`/`NamedPipeClient`，在一个位置实现 4-byte LE framing、1 MiB 上限、timeout 和 Windows error 归一化。Worker pipe 与 command pipe 都调用它；current-user/SYSTEM `SECURITY_ATTRIBUTES`、`reject_remote_clients`、`first_pipe_instance` 和 `max_instances` 保持现有安全含义。
+- **Broker control contract**：集中拥有 `0.1` 常量、wire-to-domain 转换、`CommandId`、`ValidatedCommand`、`CommandAck`、response shape 和错误码。校验顺序固定为 frame、Protobuf、command ID、version、command、路径结构；非法 ID 在任何错误响应中都不得回显。
+- **Command endpoint**：每个 task 从 accept 到 response 始终拥有自己的连接，accept 后先补下一个 listener，再有界 decode。合法请求以 `PendingCommand { command, reply }` 进入状态队列；endpoint 不接触 reducer，状态线程不接触 pipe handle。endpoint 拥有 shutdown signal、连接任务和 join handle，Drop 返回前必须完成停止与 join。
+- **Broker runtime**：消费 `InstanceLease`、endpoint、router 和 event sink，是唯一状态所有者。它路由 `ValidatedCommand`、通过 reply 返回 `CommandAck`、执行最小 effect runner，并在退出时先停 endpoint、最后释放 lease。
+- **Command router / Session reducer**：router 只做纯领域映射、request ID 生成和 duplicate cache；不再解码 Protobuf，也不调用文件系统。reducer 的 state/effect 不变量保持不变。
+- **统一观测**：一个 typed `BrokerEvent` 和一个真实 `EventSink` 接缝同时服务生产日志与测试 recorder。事件覆盖 instance、endpoint、command、session transition、duplicate、queue、stale 和 failure；不存在真实状态变化的 `lease-lost` 从契约删除，以 `lease-released`/`takeover` 表达实际行为。
 
 ### 请求 / 数据怎么走
 
 ```text
 second Broker process
   -> acquire existing session lease (fails)
-  -> current-user command pipe
-  -> bounded Protobuf command + command_id
-  -> primary validates frame, version and dedupe entry
-  -> ack(accepted/rejected, request_id when accepted)
-  -> bounded command queue
-  -> Session reducer
-  -> cancel(old request_id) + Closing { old, next }
-  -> cleanup(old request_id)
-  -> Resolving(next request_id)
-  -> effect runner emits phase completion/error
-  -> reducer accepts only the active/closing request_id
+  -> Tokio current-user command pipe
+  -> BrokerControlRequest protobuf
+  -> BrokerControlContract -> ValidatedCommand
+  -> bounded PendingCommand { command, reply }
+  -> BrokerRuntime -> CommandRouter -> SessionReducer
+  -> CommandAck -> reply -> endpoint
+  -> BrokerControlContract validates/encodes response
+  -> secondary accepts exit status only after response validation
 ```
 
-`request_id` 由主 Broker 生成，不由第二进程决定；`command_id` 只用于转发确认幂等。Broker control request/response 使用独立的 Protobuf message，复用 v0 版本规则和 framing，但不复用要求 `request_id` 的 Worker `Envelope`。接受 command 的 ack 表示请求已进入 Broker 会话，不表示已经 `Ready`。如果命令在输入校验、队列容量或协议版本阶段被拒绝，ack 携带稳定错误代码，次实例退出非零；如果渲染后来失败，错误作为带 `request_id` 的异步 session event 记录并走 `Closing -> Idle`，不会让次实例重新提交同一命令。
+`request_id` 仍由主 Broker 生成，`command_id` 只用于传输幂等。`accepted=true` 的唯一含义是 command 已进入 session：Open 返回非空 `request_id`，Close 可以为空；accepted 不带 error code。同步 rejection 表示 command 未进入 session，必须带稳定 reason 且不带 request ID。路径不存在、拒绝访问或后续解析失败属于 `Resolving` 的异步 session failure，不反向改变已经返回的 ack。
+
+容量语义分开命名并从一个内部配置推导：queued commands、active routed command、concurrent decoding connections 和 listener reserve。endpoint 从未出现返回 `primary-not-ready`；endpoint 存在但连接槽耗尽返回 `primary-busy`；命令已解码但状态队列已满返回 `queue-full`。同一数值不再同时代表 queue、decoder 和 Win32 pipe instance。
 
 状态转换的核心不变量：
 
@@ -133,33 +136,43 @@ second Broker process
 - 只实现当前交互式会话内的单实例；不为同一用户的其他 Terminal Services 会话转发命令，也不把 `Global\\` 对象暴露给跨会话客户端。
 - pipe 的 current-user DACL 是访问边界，不是完整沙箱；同一用户权限下的命令仍须做输入校验和队列限制。Worker 仍不能通过路径重新打开预览文件。
 - 不在本 Issue 接管热键、Shell 选择、Viewer 窗口、旧插件、Renderer 路由或安装/更新；它们只能通过未来的 adapter 消费已定义的 Broker session events。
-- 不用全局可变 singleton 让 pipe 线程直接修改状态，不以 sleep/retry 代替明确的 lease、ack 和 deadline。
+- 不在本 Issue 实现真实 Shell Resolver；只把 path existence/access/identity 明确移入 `Resolving` 的未来 effect 边界。
+- 不用全局可变 singleton 让 pipe task 直接修改状态，不以 sleep/retry 代替明确的 lease、ack、capacity 和 deadline。
+- 不保留手写 Overlapped transport 作为 fallback，也不再制造第二套 framing、版本常量、ack factory 或日志字符串表。
 
 ### 设计侧重点
 
-- **可靠性**：Mutex 是主实例所有权，pipe connect/ack、queue 和 duplicate cache 都有上限；主实例启动失败或崩溃后，等待者通过 signaled/abandoned Mutex 重新选主，不依赖 stale PID 文件；`Closing` 串行交接防止旧执行资源与新请求并存。
-- **可测试性**：reducer 是纯输入/输出模块；测试通过 command/event 接口检查 phase、effect 和 stale 行为，Windows 集成测试只覆盖真实 Mutex、pipe 和多进程竞态。
-- **安全性**：命令必须通过 current-user + SYSTEM DACL、local-only pipe、major/version、frame size 和路径输入校验；命令 pipe 只请求 Broker 行为，不传递可被 Worker 直接使用的句柄或未审查路径。
-- **可观测性**：ack 错误码、phase transition、queue-full、duplicate、lease-lost 和 stale event 使用稳定事件名；日志只带 request/command id 和经过归一化的原因，避免把文件路径作为常规诊断内容。
+- **可靠性**：用成熟 runtime 管理异步 I/O 生命周期；一个慢连接不能占住唯一 listener，所有连接/queue/deadline 都有独立上限；显式 shutdown/join 后才释放 lease。
+- **可维护性**：wire/domain、framing、版本、ack shape、错误码和事件名各只有一个权威实现；旧 helper 被替换而不是叠加。
+- **安全性**：迁移不改变 current-user + SYSTEM DACL、local-only、非继承 handle、frame 上限或 Worker PID 验证；结构校验仍在 trust boundary，资源解析留在 Broker session 内。
+- **可测试性与可观测性**：纯 contract/router/reducer 通过公开领域接口测试；真实 Windows 集成只验证 pipe、ACL、deadline、lifecycle 和进程竞态；生产与测试消费同一 `BrokerEvent`。
 
 ### 一步步怎么改
 
-1. 在协议中增加独立的最小 `BrokerControlRequest`/`BrokerControlResponse` message，复用 v0 的版本规则和 framing，但不复用 Worker `Envelope`；固定 UTF-16LE path、字段上限、稳定错误代码和 `command_id` 语义。
-2. 在 Broker 内实现 session-scoped `InstanceLease` 和确定命名的 command pipe。先在测试启动器中证明并发选主、初始化竞态、崩溃重启和 DACL/remote rejection，再接入 `main`。
-3. 实现纯 `SessionReducer` 与 effect 列表，覆盖全部 phase、`Closing { old, next }` 的 latest-wins 合并、cancel 一次性语义、cleanup 和 stale event；用可控 fake effect runner 完成单元测试。
-4. 实现 primary/secondary command router：输入校验、bounded queue、bounded duplicate cache、ack deadline 和非零失败退出；把 `OpenPath` 先保留为控制面输入，不连接 Shell 或 Renderer。
-5. 把最小事件循环接到现有 Broker probe/WorkerSupervisor 的存活边界，验证 primary 不因 secondary malformed command、Worker crash 或 stale event 退出；记录证据后再拆下一个 Shell/Viewer Issue。
+1. 先以测试固定 `BrokerControlContract`、response validation 和新的 accepted/path 语义，再让 router 只接收 `ValidatedCommand`。
+2. 引入 Tokio Windows Named Pipe，把共享 frame I/O 和 Worker `PipeServer` 迁移到一个 transport，删除手写 Overlapped read/write/cancel。
+3. 用 endpoint-owned connection task 和 reply handle 重建 command server/client，加入有界 decode、独立 capacity、显式 shutdown/join 和响应一致性校验。
+4. 引入最小 `BrokerRuntime`/`BrokerEvent`，把 main 收成启动、运行和退出；删除 router 的 `Path::exists()`，记录 duplicate、queue、phase、stale 和 failure。
+5. 补齐 DACL/remote flag、slow client、delayed broken pipe、graceful same-name takeover、forged response、capacity 和 x64 回归证据，再运行完整 foundation gate。
 
 ### 怎么确认做对
 
-- Reducer 单元测试：覆盖所有合法 phase 转换、无效转换、快速 request replacement、cancel/cleanup 竞态、stale result、重复 event 和 `Close` 幂等。
-- Windows instance 集成测试：并发启动至少 10 个 x64 Broker，断言恰有一个 lease owner；所有 secondary 收到 ack 并退出，owner 在整个测试中保持存活。
-- Recovery 集成测试：杀掉 owner 后重新启动，断言新进程取得 lease、重建 endpoint，旧 command 不会被重复执行；主实例初始化尚未完成时，secondary 在 startup deadline 内重试，lease 仍被持有则返回稳定 `primary-not-ready`，lease 变为 signaled/abandoned 则由一个等待者接管并处理自己的启动命令。
-- Protocol/security 测试：wrong major、oversized frame、invalid UTF-16LE/path、queue full、duplicate `command_id`、远程连接拒绝和当前用户 pipe 访问均有稳定错误结果。
-- Request integration：连续提交 `request-1`、`request-2`，断言先进入 `Closing { request-1, request-2 }`，`request-1` cleanup 后才启动 `request-2`，且只有 `request-2` 能推进到 `Ready`；迟到的 `request-1` 完成不能改变 phase。Broker/WorkerProbe 仍须报告 `8664 machine (x64)`，Rust target 列表不得出现 ARM64。
-- 运行方式：新增测试纳入 `tools/test-foundation.ps1`，并保留现有 Rust fmt/Clippy、.NET parity、legacy build 和 foundation gate；本 Issue 不以 GitHub-hosted run 作为本地关闭前提。
+- Contract：wrong/mismatched version、非法或超长 ID、mismatched response ID、accepted/rejected shape、结构化路径和错误优先级都有表驱动测试；非法 ID 不出现在响应。
+- Transport：延迟部分 frame 后断开稳定为 `truncated-frame`；一个慢客户端存在时正常 secondary 仍成功；所有 decode 槽耗尽时稳定 `primary-busy` 且资源有界；decoded queue 满返回 `queue-full`。
+- Lifecycle：Drop server 后立即用同名 product ID 重建成功；graceful shutdown 先产生 endpoint-stopped/lease-released，再允许新 owner；crash takeover 仍由 abandoned/signaled Mutex 完成。
+- Runtime：router 测试不创建文件 fixture、不访问文件系统；absolute missing path 获得 accepted/request ID 并停在 `Resolving`，未来 `Failed(request_id)` 才进入 cleanup；duplicate/phase/stale 通过同一 event recorder 观察。
+- Security：读取真实 pipe security descriptor，ACE 只包含 SYSTEM 和当前用户；读取 pipe flags 确认 remote rejection；当前用户真实 client 可以完成 round trip。
+- 回归：Worker handshake、handle transfer、supervision、protocol parity、十进程选主和 500 次 command round trip 继续通过；`tools/test-foundation.ps1` 退出 0，PE 为 x64，installed targets 与仓库配置不含 ARM64。
 
-## 验证
+## 已有验证与失效证据
+
+以下记录描述 `7e62a7b` 的既有通过面，不是关闭证据。2026-07-23 review 已证明其中部分错误语义和生命周期结论需要由上述实现替换后重新验证。
+
+- 正向 command round trip 额外重复 500/500，通过；因此没有把 response handle 立即关闭视为已复现故障。
+- delayed partial-frame client 在 read pending 后断开，真实 Broker 输出 `error_code=transport-error`，证明同步断管测试没有覆盖 `GetOverlappedResult(ReadFile)` 的错误归一化。
+- 一个 partial-frame client 占住 listener 时，健康 primary 下的正常 `--close` secondary 在 527 ms 后以 `primary-not-ready` 退出 1，证明 pre-decode connection 没有被 queue/capacity 保护。
+- `wait_for_overlapped` 的 cancellation grace 只保留 `OVERLAPPED` 和 event，没有保留仍被内核引用的 read/write buffer；这项内存安全问题由代码所有权直接证明，不以现有测试通过抵消。
+- `BrokerCommandServer::Drop` 只设置 stop flag，不保存/join listener；`Path::exists()` 仍在唯一状态线程；client 只 decode response，不验证 version、command ID 或 ack shape。
 
 - 完整 gate：`pwsh -NoProfile -File tools/test-foundation.ps1` 退出 `0`。实际出现 `QUICKLOOK_BASELINE_OK=b13df028f3cce1f84792f7043b57bf5cea3a3e4c`、`LEGACY_BUILD_OK`、`FOUNDATION_STEP=broker-single-instance`、`FOUNDATION_GATE_OK`；rustfmt、workspace Clippy、Release x64 Worker build、显式 Broker build、legacy build 和 .NET build 均成功。
 - Rust workspace：Broker 46 个测试与 protocol 5 个测试全部通过。Broker 明细为 command raw/deadline 6、command transport 10、single-instance process 4、router 6、Worker handshake 5、handle transfer 2、instance lease 4、request reducer 6、supervision/stale 3；无失败、忽略或遗留子进程。
