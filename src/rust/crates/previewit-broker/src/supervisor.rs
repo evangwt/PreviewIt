@@ -252,7 +252,7 @@ impl WorkerSupervisor {
         }
     }
 
-    fn receive_current(&self) -> Result<Envelope, SupervisorError> {
+    fn receive_current(&mut self) -> Result<Envelope, SupervisorError> {
         let envelope = self.pipe.receive_envelope()?;
         let expected = self
             .current_request_id

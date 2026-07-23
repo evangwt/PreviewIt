@@ -1,31 +1,29 @@
 use std::io;
 use std::mem::zeroed;
+use std::os::windows::io::AsRawHandle;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use previewit_protocol::v0::{Envelope, HelloAck, envelope};
-use previewit_protocol::{MAX_CONTROL_FRAME, encode_frame};
+use previewit_protocol::{MAX_CONTROL_FRAME, PROTOCOL_MAJOR, PROTOCOL_MINOR, encode_frame};
 use prost::Message;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::runtime::{Builder, Runtime};
+use tokio::time::timeout;
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
-};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
-};
+use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, GetNamedPipeClientProcessId};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::windows_security::{CurrentUserSecurity, OwnedHandle, WindowsSecurityError};
 
-const PROTOCOL_MAJOR: u32 = 0;
-const PROTOCOL_MINOR: u32 = 1;
 const REQUIRED_CAPABILITY: &str = "read-handle-v0";
 const PIPE_BUFFER_SIZE: u32 = (MAX_CONTROL_FRAME + 4) as u32;
 const CANCELLATION_GRACE: Duration = Duration::from_secs(1);
@@ -72,7 +70,8 @@ impl From<WindowsSecurityError> for BrokerError {
 }
 
 pub struct PipeServer {
-    handle: OwnedHandle,
+    handle: NamedPipeServer,
+    runtime: Runtime,
     name: String,
     startup_timeout: Duration,
     io_timeout: Duration,
@@ -88,27 +87,38 @@ impl PipeServer {
         io_timeout: Duration,
     ) -> Result<Self, BrokerError> {
         let name = format!("PreviewIt-{}", Uuid::new_v4().simple());
-        let full_name = wide(&format!(r"\\.\pipe\{name}"));
+        let full_name = format!(r"\\.\pipe\{name}");
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|source| BrokerError::Windows {
+                operation: "create Tokio pipe runtime",
+                source,
+            })?;
         let security = CurrentUserSecurity::new()?;
-
+        let _entered = runtime.enter();
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .max_instances(1)
+            .in_buffer_size(PIPE_BUFFER_SIZE)
+            .out_buffer_size(PIPE_BUFFER_SIZE);
         let handle = unsafe {
-            CreateNamedPipeW(
-                full_name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                PIPE_BUFFER_SIZE,
-                PIPE_BUFFER_SIZE,
-                0,
-                security.attributes(),
+            options.create_with_security_attributes_raw(
+                &full_name,
+                security.attributes().cast_mut().cast(),
             )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(last_error("CreateNamedPipeW"));
         }
+        .map_err(|source| BrokerError::Windows {
+            operation: "CreateNamedPipeW",
+            source,
+        })?;
 
         Ok(Self {
-            handle: OwnedHandle::new(handle),
+            handle,
+            runtime,
             name,
             startup_timeout,
             io_timeout,
@@ -119,11 +129,14 @@ impl PipeServer {
         &self.name
     }
 
-    pub fn accept_hello(&self, expected_pid: u32) -> Result<Envelope, BrokerError> {
+    pub fn accept_hello(&mut self, expected_pid: u32) -> Result<Envelope, BrokerError> {
         self.connect()?;
 
         let mut actual_pid = 0;
-        if unsafe { GetNamedPipeClientProcessId(self.handle.raw(), &mut actual_pid) } == 0 {
+        if unsafe {
+            GetNamedPipeClientProcessId(self.handle.as_raw_handle().cast(), &mut actual_pid)
+        } == 0
+        {
             return Err(last_error("GetNamedPipeClientProcessId"));
         }
         if actual_pid != expected_pid {
@@ -159,7 +172,7 @@ impl PipeServer {
         Ok(envelope)
     }
 
-    pub fn send_hello_ack(&self, hello_ack: HelloAck) -> Result<(), BrokerError> {
+    pub fn send_hello_ack(&mut self, hello_ack: HelloAck) -> Result<(), BrokerError> {
         let envelope = Envelope {
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
@@ -169,25 +182,115 @@ impl PipeServer {
         self.send_envelope(&envelope)
     }
 
-    pub fn send_envelope(&self, envelope: &Envelope) -> Result<(), BrokerError> {
+    pub fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), BrokerError> {
         self.write_frame(&envelope.encode_to_vec())
     }
 
-    pub fn receive_envelope(&self) -> Result<Envelope, BrokerError> {
+    pub fn receive_envelope(&mut self) -> Result<Envelope, BrokerError> {
         let payload = self.read_frame()?;
         Ok(Envelope::decode(payload.as_slice())?)
     }
 
-    fn connect(&self) -> Result<(), BrokerError> {
-        connect_pipe(self.handle.raw(), self.startup_timeout)
+    fn connect(&mut self) -> Result<(), BrokerError> {
+        let Self {
+            handle,
+            runtime,
+            startup_timeout,
+            ..
+        } = self;
+        runtime.block_on(async {
+            match timeout(*startup_timeout, handle.connect()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(source)) => Err(BrokerError::Windows {
+                    operation: "ConnectNamedPipe",
+                    source,
+                }),
+                Err(_) => Err(BrokerError::StartupTimeout),
+            }
+        })
     }
 
-    fn read_frame(&self) -> Result<Vec<u8>, BrokerError> {
-        read_frame(self.handle.raw(), self.io_timeout)
+    fn read_frame(&mut self) -> Result<Vec<u8>, BrokerError> {
+        let Self {
+            handle,
+            runtime,
+            io_timeout,
+            ..
+        } = self;
+        runtime.block_on(read_frame_async(handle, *io_timeout))
     }
 
-    fn write_frame(&self, payload: &[u8]) -> Result<(), BrokerError> {
-        write_frame(self.handle.raw(), payload, self.io_timeout)
+    fn write_frame(&mut self, payload: &[u8]) -> Result<(), BrokerError> {
+        let Self {
+            handle,
+            runtime,
+            io_timeout,
+            ..
+        } = self;
+        runtime.block_on(write_frame_async(handle, payload, *io_timeout))
+    }
+}
+
+pub(crate) async fn read_frame_async<T>(
+    io: &mut T,
+    io_timeout: Duration,
+) -> Result<Vec<u8>, BrokerError>
+where
+    T: AsyncRead + Unpin,
+{
+    let operation = async {
+        let mut length_bytes = [0_u8; 4];
+        io.read_exact(&mut length_bytes)
+            .await
+            .map_err(normalize_read_error)?;
+        let declared = u32::from_le_bytes(length_bytes) as usize;
+        if declared > MAX_CONTROL_FRAME {
+            return Err(BrokerError::ControlFrameTooLarge { declared });
+        }
+
+        let mut payload = vec![0_u8; declared];
+        io.read_exact(&mut payload)
+            .await
+            .map_err(normalize_read_error)?;
+        Ok(payload)
+    };
+
+    match timeout(io_timeout, operation).await {
+        Ok(result) => result,
+        Err(_) => Err(BrokerError::ReadTimeout),
+    }
+}
+
+pub(crate) async fn write_frame_async<T>(
+    io: &mut T,
+    payload: &[u8],
+    io_timeout: Duration,
+) -> Result<(), BrokerError>
+where
+    T: AsyncWrite + Unpin,
+{
+    let frame = encode_frame(payload)?;
+    match timeout(io_timeout, io.write_all(&frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(source)) => Err(BrokerError::Windows {
+            operation: "WriteFile",
+            source,
+        }),
+        Err(_) => Err(BrokerError::WriteTimeout),
+    }
+}
+
+fn normalize_read_error(source: io::Error) -> BrokerError {
+    if source.kind() == io::ErrorKind::UnexpectedEof
+        || source.kind() == io::ErrorKind::BrokenPipe
+        || matches!(source.raw_os_error(), Some(code) if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_NO_DATA as i32)
+    {
+        BrokerError::TruncatedControlFrame
+    } else {
+        BrokerError::Windows {
+            operation: "ReadFile",
+            source,
+        }
     }
 }
 
@@ -342,14 +445,6 @@ fn write_once(handle: HANDLE, buffer: &[u8], timeout: Duration) -> Result<usize,
     .map(|written| written as usize)
 }
 
-impl Drop for PipeServer {
-    fn drop(&mut self) {
-        unsafe {
-            DisconnectNamedPipe(self.handle.raw());
-        }
-    }
-}
-
 fn create_event() -> Result<OwnedHandle, BrokerError> {
     let handle = unsafe { CreateEventW(null(), 1, 0, null()) };
     if handle.is_null() {
@@ -395,10 +490,6 @@ fn timeout_ms(duration: Duration) -> u32 {
     duration.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
-}
-
 fn last_error(operation: &'static str) -> BrokerError {
     BrokerError::Windows {
         operation,
@@ -410,5 +501,46 @@ fn error_code(operation: &'static str, code: u32) -> BrokerError {
     BrokerError::Windows {
         operation,
         source: io::Error::from_raw_os_error(code as i32),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn delayed_partial_frame_is_stably_truncated() {
+        let mut server =
+            PipeServer::create_with_timeouts(Duration::from_secs(2), Duration::from_secs(2))
+                .unwrap();
+        let pipe_path = format!(r"\\.\pipe\{}", server.name());
+        let client = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut pipe = loop {
+                match OpenOptions::new().read(true).write(true).open(&pipe_path) {
+                    Ok(pipe) => break pipe,
+                    Err(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("raw client could not connect: {error}"),
+                }
+            };
+            pipe.write_all(&[10, 0, 0, 0, 1, 2]).unwrap();
+            pipe.flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        server.connect().unwrap();
+        let error = server.receive_envelope().unwrap_err();
+
+        assert!(
+            matches!(error, BrokerError::TruncatedControlFrame),
+            "unexpected error: {error:?}"
+        );
+        client.join().unwrap();
     }
 }

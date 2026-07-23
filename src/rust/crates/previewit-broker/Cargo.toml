@@ -9,6 +9,7 @@ rust-version.workspace = true
 previewit-protocol = { path = "../previewit-protocol" }
 prost = "0.14.4"
 thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

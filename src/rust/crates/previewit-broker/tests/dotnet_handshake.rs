@@ -47,7 +47,7 @@ fn assert_hello(hello: &Envelope) {
 
 #[test]
 fn dotnet_worker_completes_authenticated_handshake() {
-    let server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
+    let mut server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
     assert!(server.name().starts_with("PreviewIt-"));
     assert!(!server.name().contains(['\\', '/']));
     let mut worker = launch_worker(&server, &[]);
@@ -69,7 +69,7 @@ fn dotnet_worker_completes_authenticated_handshake() {
 
 #[test]
 fn non_expected_client_pid_is_rejected_before_protocol_read() {
-    let server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
+    let mut server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
     let mut worker = launch_worker(&server, &[]);
 
     let error = server
@@ -83,7 +83,7 @@ fn non_expected_client_pid_is_rejected_before_protocol_read() {
 
 #[test]
 fn protocol_major_mismatch_is_rejected() {
-    let server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
+    let mut server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
     let mut worker = launch_worker(&server, &["--protocol-major", "1"]);
 
     let error = server
@@ -101,7 +101,7 @@ fn protocol_major_mismatch_is_rejected() {
 
 #[test]
 fn oversized_control_frame_is_rejected() {
-    let server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
+    let mut server = PipeServer::create(Duration::from_secs(5)).expect("create pipe");
     let mut worker = launch_worker(&server, &["--oversized"]);
 
     let error = server
@@ -115,7 +115,7 @@ fn oversized_control_frame_is_rejected() {
 
 #[test]
 fn startup_deadline_expires_without_client() {
-    let server = PipeServer::create(Duration::from_millis(100)).expect("create pipe");
+    let mut server = PipeServer::create(Duration::from_millis(100)).expect("create pipe");
 
     let error = server
         .accept_hello(1)
