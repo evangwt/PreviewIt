@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -48,8 +47,6 @@ pub enum BrokerCommandError {
     ResponseContract(#[from] InvalidCommandResponse),
     #[error("the Broker command listener stopped")]
     ListenerStopped,
-    #[error("there is no pending Broker command response")]
-    NoPendingResponse,
     #[error("the command client stopped before receiving its response")]
     ResponseReceiverDropped,
     #[error(transparent)]
@@ -65,7 +62,6 @@ impl BrokerCommandError {
             Self::InvalidResponse(_) => "invalid-response",
             Self::ResponseContract(error) => error.code(),
             Self::ListenerStopped => "listener-stopped",
-            Self::NoPendingResponse => "no-pending-response",
             Self::ResponseReceiverDropped => "response-receiver-dropped",
             Self::Transport(error) => match error {
                 BrokerError::StartupTimeout => "startup-timeout",
@@ -95,7 +91,6 @@ impl From<WindowsSecurityError> for BrokerCommandError {
 
 pub struct PendingCommand {
     command: ValidatedCommand,
-    wire_request: BrokerControlRequest,
     reply: oneshot::Sender<CommandAck>,
 }
 
@@ -119,7 +114,6 @@ pub struct BrokerCommandServer {
     shutdown: Option<oneshot::Sender<()>>,
     endpoint_thread: Option<JoinHandle<()>>,
     receive_timeout: Duration,
-    legacy_pending: Mutex<Option<PendingCommand>>,
 }
 
 impl BrokerCommandServer {
@@ -151,7 +145,6 @@ impl BrokerCommandServer {
                 shutdown: Some(shutdown),
                 endpoint_thread: Some(endpoint_thread),
                 receive_timeout: startup_timeout,
-                legacy_pending: Mutex::new(None),
             }),
             Ok(Err(error)) => {
                 let _ = endpoint_thread.join();
@@ -171,37 +164,6 @@ impl BrokerCommandServer {
                 RecvTimeoutError::Timeout => BrokerError::StartupTimeout.into(),
                 RecvTimeoutError::Disconnected => BrokerCommandError::ListenerStopped,
             })
-    }
-
-    // Transitional adapter for the raw router. Task 4 removes it when routing becomes domain-only.
-    pub fn receive_request(&self) -> Result<BrokerControlRequest, BrokerCommandError> {
-        let pending = self.receive()?;
-        let request = pending.wire_request.clone();
-        let mut active = self
-            .legacy_pending
-            .lock()
-            .map_err(|_| BrokerCommandError::ListenerStopped)?;
-        if active.is_some() {
-            return Err(BrokerCommandError::NoPendingResponse);
-        }
-        *active = Some(pending);
-        Ok(request)
-    }
-
-    // Transitional adapter for the raw router. Task 4 removes it when routing becomes domain-only.
-    pub fn send_response(
-        &self,
-        response: &BrokerControlResponse,
-    ) -> Result<(), BrokerCommandError> {
-        let pending = self
-            .legacy_pending
-            .lock()
-            .map_err(|_| BrokerCommandError::ListenerStopped)?
-            .take()
-            .ok_or(BrokerCommandError::NoPendingResponse)?;
-        let expected = expected_for_command(pending.command());
-        let ack = BrokerControlContract::decode_response(&expected, response.clone())?;
-        pending.respond(ack)
     }
 
     pub fn shutdown(&mut self) -> Result<(), BrokerCommandError> {
@@ -379,7 +341,7 @@ async fn handle_connection(
             return;
         }
     };
-    let command = match BrokerControlContract::decode_request(wire_request.clone()) {
+    let command = match BrokerControlContract::decode_request(wire_request) {
         Ok(command) => command,
         Err(rejection) => {
             let _ = write_ack(&mut pipe, &rejection.into_ack(), io_timeout).await;
@@ -390,11 +352,7 @@ async fn handle_connection(
 
     let command_id = command.command_id().clone();
     let (reply, response) = oneshot::channel();
-    let pending = PendingCommand {
-        command,
-        wire_request,
-        reply,
-    };
+    let pending = PendingCommand { command, reply };
     match sender.try_send(pending) {
         Ok(()) => {
             if let Ok(Ok(ack)) = timeout(io_timeout, response).await {

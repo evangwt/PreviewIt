@@ -96,17 +96,21 @@ fn run_primary(
     let mut router = CommandRouter::new();
 
     if let Some(request) = startup_command {
-        let (response, _) = router.route(request);
+        let ack = match BrokerControlContract::decode_request(request) {
+            Ok(command) => router.route(command).ack,
+            Err(rejection) => rejection.into_ack(),
+        };
+        let response = BrokerControlContract::encode_response(&ack);
         print_response("primary", &response);
     } else {
         print_ready_primary();
     }
 
     loop {
-        match server.receive_request() {
-            Ok(request) => {
-                let (response, _) = router.route(request);
-                if let Err(error) = server.send_response(&response) {
+        match server.receive() {
+            Ok(pending) => {
+                let result = router.route(pending.command().clone());
+                if let Err(error) = pending.respond(result.ack) {
                     eprintln!(
                         "role=primary event=response-error error_code={}",
                         error.code()

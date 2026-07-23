@@ -1,52 +1,25 @@
 use std::collections::VecDeque;
-use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use previewit_broker::{CommandRouter, PreviewRequest, SessionEffect, SessionState};
-use previewit_protocol::v0::{
-    BrokerControlRequest, ClosePreview, OpenPath, broker_control_request,
+use previewit_broker::{
+    BrokerCommand, CommandAck, CommandId, CommandRouter, PreviewRequest, RouteDisposition,
+    SessionEffect, SessionState, ValidatedCommand,
 };
 
-fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(4)
-        .expect("repository root")
-        .to_path_buf()
+fn absolute_path(label: &str) -> PathBuf {
+    PathBuf::from(format!(r"C:\definitely-missing-previewit\{label}.txt"))
 }
 
-fn fixture() -> PathBuf {
-    repository_root()
-        .join("tests")
-        .join("fixtures")
-        .join("handles")
-        .join("read-only.txt")
+fn open(command_id: &str, path: PathBuf) -> ValidatedCommand {
+    ValidatedCommand::new(
+        CommandId::parse(command_id).unwrap(),
+        BrokerCommand::Open(path),
+    )
+    .unwrap()
 }
 
-fn open(command_id: &str, path: &Path) -> BrokerControlRequest {
-    BrokerControlRequest {
-        protocol_major: 0,
-        protocol_minor: 1,
-        command_id: command_id.into(),
-        command: Some(broker_control_request::Command::OpenPath(OpenPath {
-            path_utf16le: path
-                .as_os_str()
-                .encode_wide()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        })),
-    }
-}
-
-fn close(command_id: &str) -> BrokerControlRequest {
-    BrokerControlRequest {
-        protocol_major: 0,
-        protocol_minor: 1,
-        command_id: command_id.into(),
-        command: Some(broker_control_request::Command::ClosePreview(
-            ClosePreview {},
-        )),
-    }
+fn close(command_id: &str) -> ValidatedCommand {
+    ValidatedCommand::new(CommandId::parse(command_id).unwrap(), BrokerCommand::Close).unwrap()
 }
 
 fn router_with_ids(ids: &[&str], capacity: usize) -> CommandRouter {
@@ -55,109 +28,102 @@ fn router_with_ids(ids: &[&str], capacity: usize) -> CommandRouter {
 }
 
 #[test]
-fn absolute_existing_path_is_accepted() {
-    let path = fixture();
-    let request = PreviewRequest {
-        request_id: "request-1".into(),
-        path: path.clone(),
-    };
+fn absolute_missing_path_enters_resolving_without_filesystem_io() {
+    let path = absolute_path("missing");
     let mut router = router_with_ids(&["request-1"], 8);
 
-    let (response, effects) = router.route(open("command-1", &path));
+    let result = router.route(open("command-1", path.clone()));
 
-    assert!(response.accepted);
-    assert_eq!(response.command_id, "command-1");
-    assert_eq!(response.request_id, "request-1");
-    assert!(response.error_code.is_empty());
-    assert_eq!(effects, vec![SessionEffect::BeginResolve(request.clone())]);
-    assert_eq!(router.state(), &SessionState::Resolving(request));
-}
-
-#[test]
-fn relative_and_missing_paths_are_rejected_before_allocating_request_ids() {
-    let path = fixture();
-    let missing = path.with_file_name("missing-previewit-fixture.txt");
-    assert!(!missing.exists());
-    let mut router = router_with_ids(&["request-after-rejections"], 8);
-
-    let (relative, relative_effects) = router.route(open(
-        "command-relative",
-        Path::new(r"tests\fixtures\handles\read-only.txt"),
+    assert!(matches!(
+        result.ack,
+        CommandAck::OpenAccepted { ref request_id, .. } if request_id == "request-1"
     ));
-    let (absent, absent_effects) = router.route(open("command-missing", &missing));
-    let (accepted, _) = router.route(open("command-valid", &path));
-
-    assert!(!relative.accepted);
-    assert_eq!(relative.error_code, "path-not-absolute");
-    assert!(relative_effects.is_empty());
-    assert!(!absent.accepted);
-    assert_eq!(absent.error_code, "path-not-found");
-    assert!(absent_effects.is_empty());
-    assert_eq!(accepted.request_id, "request-after-rejections");
+    assert_eq!(result.disposition, RouteDisposition::Routed);
+    assert_eq!(
+        result.effects,
+        vec![SessionEffect::BeginResolve(PreviewRequest {
+            request_id: "request-1".into(),
+            path: path.clone(),
+        })]
+    );
+    assert_eq!(
+        router.state(),
+        &SessionState::Resolving(PreviewRequest {
+            request_id: "request-1".into(),
+            path,
+        })
+    );
 }
 
 #[test]
 fn close_is_accepted_and_idempotent() {
-    let path = fixture();
     let mut router = router_with_ids(&["request-1"], 8);
-    router.route(open("command-open", &path));
+    router.route(open("command-open", absolute_path("open")));
 
-    let (first, first_effects) = router.route(close("command-close-1"));
-    let (second, second_effects) = router.route(close("command-close-2"));
+    let first = router.route(close("command-close-1"));
+    let second = router.route(close("command-close-2"));
 
-    assert!(first.accepted);
-    assert!(first.request_id.is_empty());
+    assert!(matches!(first.ack, CommandAck::CloseAccepted { .. }));
+    assert_eq!(first.disposition, RouteDisposition::Routed);
     assert_eq!(
-        first_effects,
+        first.effects,
         vec![SessionEffect::Cancel("request-1".into())]
     );
-    assert!(second.accepted);
-    assert!(second.request_id.is_empty());
-    assert!(second_effects.is_empty());
+    assert!(matches!(second.ack, CommandAck::CloseAccepted { .. }));
+    assert_eq!(second.disposition, RouteDisposition::Routed);
+    assert!(second.effects.is_empty());
     assert_eq!(router.state(), &SessionState::Idle);
 }
 
 #[test]
-fn duplicate_command_replays_response_without_second_transition() {
-    let path = fixture();
-    let request = open("command-duplicate", &path);
+fn duplicate_command_has_explicit_disposition_and_no_second_transition() {
+    let path = absolute_path("duplicate");
     let mut router = router_with_ids(&["request-1", "request-unused"], 8);
 
-    let (first, first_effects) = router.route(request.clone());
+    let first = router.route(open("command-duplicate", path.clone()));
     let state_after_first = router.state().clone();
-    let (duplicate, duplicate_effects) = router.route(request);
+    let duplicate = router.route(open("command-duplicate", path));
 
-    assert_eq!(duplicate, first);
-    assert!(!first_effects.is_empty());
-    assert!(duplicate_effects.is_empty());
+    assert_eq!(duplicate.ack, first.ack);
+    assert_eq!(first.disposition, RouteDisposition::Routed);
+    assert_eq!(duplicate.disposition, RouteDisposition::Duplicate);
+    assert!(!first.effects.is_empty());
+    assert!(duplicate.effects.is_empty());
     assert_eq!(router.state(), &state_after_first);
 }
 
 #[test]
 fn duplicate_cache_evicts_the_oldest_command() {
-    let path = fixture();
+    let path = absolute_path("eviction");
     let mut router = router_with_ids(&["request-1", "request-2", "request-3", "request-4"], 2);
 
-    let (first, _) = router.route(open("command-1", &path));
-    router.route(open("command-2", &path));
-    router.route(open("command-3", &path));
-    let (after_eviction, _) = router.route(open("command-1", &path));
+    let first = router.route(open("command-1", path.clone()));
+    router.route(open("command-2", path.clone()));
+    router.route(open("command-3", path.clone()));
+    let after_eviction = router.route(open("command-1", path));
 
-    assert_eq!(first.request_id, "request-1");
-    assert_eq!(after_eviction.request_id, "request-4");
+    assert!(
+        matches!(first.ack, CommandAck::OpenAccepted { ref request_id, .. }
+        if request_id == "request-1")
+    );
+    assert!(
+        matches!(after_eviction.ack, CommandAck::OpenAccepted { ref request_id, .. }
+        if request_id == "request-4")
+    );
+    assert_eq!(after_eviction.disposition, RouteDisposition::Routed);
 }
 
 #[test]
 fn rapid_replacement_cleans_up_each_old_request_and_keeps_the_latest() {
-    let path = fixture();
+    let path = absolute_path("replacement");
     let mut router = router_with_ids(&["request-1", "request-2", "request-3"], 8);
 
-    router.route(open("command-1", &path));
-    let (_, second_effects) = router.route(open("command-2", &path));
-    let (_, latest_effects) = router.route(open("command-3", &path));
+    router.route(open("command-1", path.clone()));
+    let second = router.route(open("command-2", path.clone()));
+    let latest = router.route(open("command-3", path.clone()));
 
     assert_eq!(
-        second_effects,
+        second.effects,
         vec![
             SessionEffect::Cancel("request-1".into()),
             SessionEffect::BeginResolve(PreviewRequest {
@@ -167,7 +133,7 @@ fn rapid_replacement_cleans_up_each_old_request_and_keeps_the_latest() {
         ]
     );
     assert_eq!(
-        latest_effects,
+        latest.effects,
         vec![
             SessionEffect::Cancel("request-2".into()),
             SessionEffect::BeginResolve(PreviewRequest {
@@ -176,6 +142,8 @@ fn rapid_replacement_cleans_up_each_old_request_and_keeps_the_latest() {
             }),
         ]
     );
+    assert_eq!(second.disposition, RouteDisposition::Routed);
+    assert_eq!(latest.disposition, RouteDisposition::Routed);
     assert_eq!(
         router.state(),
         &SessionState::Resolving(PreviewRequest {

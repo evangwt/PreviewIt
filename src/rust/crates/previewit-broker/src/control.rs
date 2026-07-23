@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 use previewit_protocol::v0::{BrokerControlRequest, BrokerControlResponse, broker_control_request};
@@ -45,12 +45,33 @@ pub struct ValidatedCommand {
 }
 
 impl ValidatedCommand {
+    pub fn new(
+        command_id: CommandId,
+        command: BrokerCommand,
+    ) -> Result<Self, CommandRejectionCode> {
+        if let BrokerCommand::Open(path) = &command {
+            let units: Vec<_> = path.as_os_str().encode_wide().collect();
+            validate_path_units(&units)?;
+            if !path.is_absolute() {
+                return Err(CommandRejectionCode::PathNotAbsolute);
+            }
+        }
+        Ok(Self {
+            command_id,
+            command,
+        })
+    }
+
     pub fn command_id(&self) -> &CommandId {
         &self.command_id
     }
 
     pub fn command(&self) -> &BrokerCommand {
         &self.command
+    }
+
+    pub fn into_parts(self) -> (CommandId, BrokerCommand) {
+        (self.command_id, self.command)
     }
 }
 
@@ -64,7 +85,6 @@ pub enum CommandRejectionCode {
     EmbeddedNul,
     PathTooLong,
     PathNotAbsolute,
-    PathNotFound,
     InvalidProtobuf,
     FrameTooLarge,
     PrimaryBusy,
@@ -82,7 +102,6 @@ impl CommandRejectionCode {
             Self::EmbeddedNul => "embedded-nul",
             Self::PathTooLong => "path-too-long",
             Self::PathNotAbsolute => "path-not-absolute",
-            Self::PathNotFound => "path-not-found",
             Self::InvalidProtobuf => "invalid-protobuf",
             Self::FrameTooLarge => "frame-too-large",
             Self::PrimaryBusy => "primary-busy",
@@ -100,7 +119,6 @@ impl CommandRejectionCode {
             "embedded-nul" => Self::EmbeddedNul,
             "path-too-long" => Self::PathTooLong,
             "path-not-absolute" => Self::PathNotAbsolute,
-            "path-not-found" => Self::PathNotFound,
             "invalid-protobuf" => Self::InvalidProtobuf,
             "frame-too-large" => Self::FrameTooLarge,
             "primary-busy" => Self::PrimaryBusy,
@@ -348,6 +366,16 @@ fn decode_path(bytes: &[u8]) -> Result<PathBuf, CommandRejectionCode> {
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
+    validate_path_units(&units)?;
+
+    let path = PathBuf::from(OsString::from_wide(&units));
+    if !path.is_absolute() {
+        return Err(CommandRejectionCode::PathNotAbsolute);
+    }
+    Ok(path)
+}
+
+fn validate_path_units(units: &[u16]) -> Result<(), CommandRejectionCode> {
     if units.len() > MAX_PATH_UTF16_UNITS {
         return Err(CommandRejectionCode::PathTooLong);
     }
@@ -357,10 +385,5 @@ fn decode_path(bytes: &[u8]) -> Result<PathBuf, CommandRejectionCode> {
     if char::decode_utf16(units.iter().copied()).any(|unit| unit.is_err()) {
         return Err(CommandRejectionCode::InvalidUtf16);
     }
-
-    let path = PathBuf::from(OsString::from_wide(&units));
-    if !path.is_absolute() {
-        return Err(CommandRejectionCode::PathNotAbsolute);
-    }
-    Ok(path)
+    Ok(())
 }

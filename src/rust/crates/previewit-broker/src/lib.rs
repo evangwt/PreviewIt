@@ -16,7 +16,7 @@ pub use control::{
 pub use handles::{HandleError, ReadOnlyDocument, RemoteHandle, current_process_handle_count};
 pub use instance::{InstanceContender, InstanceError, InstanceLease, InstanceRole};
 pub use pipe::{BrokerError, PipeServer};
-pub use router::CommandRouter;
+pub use router::{CommandRouter, RouteDisposition, RouteResult};
 pub use session::{PreviewRequest, SessionEffect, SessionEvent, SessionReducer, SessionState};
 pub use supervisor::{
     Deadlines, DocumentOutcome, ShutdownOutcome, SupervisorError, WorkerMode, WorkerSupervisor,
