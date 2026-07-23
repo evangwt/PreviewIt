@@ -1,4 +1,5 @@
 pub mod command;
+pub mod control;
 pub mod handles;
 pub mod instance;
 pub mod pipe;
@@ -8,6 +9,10 @@ pub mod supervisor;
 mod windows_security;
 
 pub use command::{BrokerCommandClient, BrokerCommandError, BrokerCommandServer};
+pub use control::{
+    BrokerCommand, BrokerControlContract, CommandAck, CommandId, CommandRejection,
+    CommandRejectionCode, ExpectedAck, InvalidCommandResponse, ValidatedCommand,
+};
 pub use handles::{HandleError, ReadOnlyDocument, RemoteHandle, current_process_handle_count};
 pub use instance::{InstanceContender, InstanceError, InstanceLease, InstanceRole};
 pub use pipe::{BrokerError, PipeServer};

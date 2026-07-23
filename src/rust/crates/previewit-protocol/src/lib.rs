@@ -4,6 +4,8 @@ pub mod v0 {
     include!(concat!(env!("OUT_DIR"), "/previewit.preview.v0.rs"));
 }
 
+pub const PROTOCOL_MAJOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
