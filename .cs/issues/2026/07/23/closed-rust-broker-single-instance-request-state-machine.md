@@ -2,7 +2,7 @@
 kind: issue
 title: "Rust Broker single-instance and request state machine"
 type: feature
-status: open
+status: closed
 created: 2026-07-23
 epic: ".cs/epics/2026/07/20/rust-hybrid-preview-architecture/spec.md"
 ---
@@ -208,7 +208,7 @@ Review 随后证明这些通过面没有覆盖四项根因：pending Overlapped 
 - Runtime effect 收敛（`ed37333 refactor: make broker runtime own session effects`）：Router 只做一次 reducer step，Runtime 成为唯一 effect pump，并按每个 `(phase, request_id)` step 发出 transition。
 - 最终验证（本次证据提交）：focused suites、四个 hostile scenario 各 20/20、完整 foundation gate、x64 PE/target/ARM64 search、removed-boundary search 与 diff check 全部完成；security unit tests 已由 workspace gate 覆盖，因此没有修改 gate 脚本。
 - Remediation acceptance review（2026-07-23）：主审复核 `3ef0edc..3cd1c5c` 的 11 个变更文件，CRITICAL/HIGH/MEDIUM/LOW 均为 0，Architectural Status 为 `CLEAR`，技术结论为 `APPROVE`。独立 code-reviewer/architect 通道因外部服务 403 未能运行，未将其伪装或计入通过证据；当前结论明确是主审技术验收，不替代用户关闭授权。
-- 范围保持：没有接入 Shell、热键、x86 Dialog Adapter、Viewer、Renderer、installer 或 updater；没有 ARM64 target、条件编译、产物或声明。Issue 继续保持 `open`，behavior-baseline Explore 继续保持 `open`，architecture Epic 继续保持 `draft`，等待用户明确授权关闭与毕业回写。
+- 范围保持：没有接入 Shell、热键、x86 Dialog Adapter、Viewer、Renderer、installer 或 updater；没有 ARM64 target、条件编译、产物或声明。用户授权后只关闭本 Issue；behavior-baseline Explore 继续保持 `open`，architecture Epic 继续保持 `draft`。
 - 首次 Acceptance review（2026-07-23）：发现组合满载会在 replacement listener 创建时停止 endpoint、release API 泄漏短生命周期 raw handle、effect feedback 仍在 Router 且 Runtime 丢弃多数 effect、queue 测试可在 `FlushFileBuffers` 无界挂起。用户确认采用结构收敛方案修复；原完整 gate 保留为历史回归证据，不代表 remediation 已完成。
 
 ## 关闭回写
@@ -219,7 +219,7 @@ Review 随后证明这些通过面没有覆盖四项根因：pending Overlapped 
 
 ## 关闭结论
 
-- 关闭判断：acceptance remediation 已实现，完整门禁与新的 harsh review 均已通过，技术上可关闭；未经用户明确授权仍不得关闭，Issue 状态保持 `open`。
+- 关闭判断：acceptance remediation、完整门禁与新的 harsh review 均已通过；用户于 2026-07-23 明确授权继续关闭，本 Issue 状态改为 `closed`。
 - 验证摘要：见“验证与历史证据”的当前收敛验证；`7e62a7b` 与 `1738f0e` 只保留为各自阶段的历史证据，当前验收以 `1404001..本次证据提交` 为准。
-- 回写位置：获得用户关闭授权后，先把稳定的会话选主、command ack、状态不变量和 stale/event 边界回写所属 Epic；不自动关闭 Epic，也不提前写入 Project Spec。
-- 遗留事项：Shell Resolver、x86 Dialog Adapter、Viewer/Legacy Host、Renderer 和完整 CLI 命令目录不属于本 Issue。
+- 回写位置：稳定的会话选主、command ack、状态/effect 不变量和过载边界已回写所属 Epic 的“当前方案”“协议和会话”“当前推进”；Epic 不自动关闭，也不提前写入 Project Spec。
+- 遗留事项：Shell Resolver、x86 Dialog Adapter、Viewer/Legacy Host、Renderer 和完整 CLI 命令目录不属于本 Issue，继续留在 Epic 的 Issues 与剩余阻碍中；本次未擅自创建后续 Issue。

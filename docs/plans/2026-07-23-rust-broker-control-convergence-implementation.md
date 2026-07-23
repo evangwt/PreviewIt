@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, Tokio Windows Named Pipes, `windows-sys`, Prost, existing `previewit-protocol`, real Windows process/ACL integration tests, PowerShell foundation gate.
 
-**Source of truth:** `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`, especially the approved `## 实现设计`. If this plan and the Issue disagree, update the Issue first. Keep the Issue and behavior Explore open and the architecture Epic draft unless the user separately authorizes closing.
+**Source of truth:** `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`, especially the approved `## 实现设计`. If this plan and the Issue disagree, update the Issue first. Keep the Issue and behavior Explore open and the architecture Epic draft unless the user separately authorizes closing.
 
 **Hard constraints:** Windows x64 only. Do not add ARM64 targets, matrices, artifacts, conditional branches, or promises. Do not add Shell Resolver, Viewer, Renderer, x86 Dialog Adapter, new Broker commands, or a second framing/event/error implementation.
 
@@ -624,7 +624,7 @@ git commit -m "test: prove broker command security boundaries"
 **Files:**
 
 - Modify: `tools/test-foundation.ps1` only if a new integration test is not already reached by the workspace test
-- Modify: `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`
+- Modify: `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`
 
 **Step 1: Run focused repetition before the full gate**
 
@@ -675,7 +675,7 @@ Keep the earlier `7e62a7b` evidence explicitly historical. Do not claim a remote
 **Step 5: Commit the verified evidence**
 
 ```powershell
-git add tools/test-foundation.ps1 .cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md
+git add tools/test-foundation.ps1 .cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md
 git commit -m "test: gate broker control convergence"
 ```
 

@@ -69,7 +69,9 @@ Renderer 使用自适应受监管 Worker：每个 Renderer 包和安全边界使
 
 Foundation 已验证协议 `0.1` 的最小子集：Protobuf envelope 使用 4-byte little-endian 长度前缀，单个控制帧最大 1 MiB，Rust 与 `net462` 保持编码和错误行为一致。`read-handle-v0` 作为显式 capability 协商；超出该子集的 Viewer、Renderer 和路由消息仍须在后续 Issue 中按真实调用路径扩展。
 
-请求状态按 `Idle -> Resolving -> Preparing -> Rendering -> Ready -> Closing` 管理。新请求取消旧请求；所有异步结果必须携带 `request_id`，过期结果丢弃。
+Broker 单实例控制面也已验证：每个交互式用户会话先通过 current-user/SYSTEM 的 session-scoped lease 选出一个 x64 primary，secondary 不初始化第二套控制面，而是通过确定命名、local-only、当前用户专属的 Named Pipe 发送一次有界 `OpenPath` 或 `Close` 并等待 typed ack。endpoint 未就绪、连接/解码饱和和已解码队列满分别使用 `primary-not-ready`、`primary-busy` 和 `queue-full`；过载拒绝不得停止 endpoint。`accepted` 只表示命令已经进入 Broker session，不承诺文件存在或预览成功。
+
+请求状态按 `Idle -> Resolving -> Preparing -> Rendering -> Ready -> Closing` 管理。新请求取消旧请求；所有异步结果必须携带 `request_id`，过期结果丢弃。Router 只做 request ID 生成、命令去重和单步领域归约，Broker Runtime 是状态与 effect 的唯一所有者；每个 reducer step 都独立观察 `(phase, request_id)`，旧请求完成清理后才允许最新 pending request 进入 `Resolving`。真实 Shell Resolver、Worker 或 Viewer 尚未接入时，Runtime 只在同一 effect 入口完成最小 cleanup feedback，后续执行资源不得绕过该入口另建状态所有者。
 
 渲染结果支持三个形态：`DocumentModel` 承载有界、版本化的语义内容，`SharedSurface` 通过共享内存或共享图形资源承载栅格、视频和 GPU 输出，`ExternalWindow` 用于 Legacy Host、系统组件和复杂交互内容。第一阶段不把跨进程任意 HWND 嵌入作为统一方案。
 
@@ -112,7 +114,7 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 
 - 继续以已导入、可复现构建的 QuickLook `4.5.0` 固定提交为兼容基线；后续 `master` 补丁保持逐项来源记录和独立验证。
 - 建立现有行为基线：热键、Shell 选择、窗口焦点、DPI、插件和失败恢复。
-- 验证 Rust Broker 能在不改变用户路径的情况下接管单实例、热键和选择获取。
+- 从已验证的 Rust Broker 单实例、typed command ack 和请求状态边界继续接入全局热键与选择获取，不把尚未验证的 Shell/Viewer 路径算作已完成。
 - 把现有 Native32/WoW64 helper 收拢为由 Broker 监督的 x86 Dialog Adapter，并验证 32 位文件对话框选择、超时和异常退出恢复。
 - 从已验证的协议 `0.1` framing、版本协商、`request_id` 和 `read-handle-v0` 边界继续扩展请求、取消、错误和版本兼容行为。
 - 把现有插件加载和 WPF Viewer 逐步收拢为 Legacy Host 边界。
@@ -123,7 +125,7 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 
 - [ ] `.cs/issues/2026/07/20/open-quicklook-behavior-baseline/index.md`：固定空格到预览、Shell 选择和插件内容三条主路径；补齐运行时兼容矩阵后关闭。
 - [x] `.cs/issues/2026/07/22/closed-preview-foundation-vertical-slice.md`：导入并构建固定基线，验证 x64 Rust/.NET 协议、身份、只读句柄与单 Worker 故障恢复边界。
-- [ ] `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`：在每个交互式会话中选出一个 x64 Broker，转发有界 command，并验证 `request_id` 状态机与 stale/cancel 规则。
+- [x] `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`：在每个交互式会话中选出一个 x64 Broker，转发有界 command，并验证 `request_id` 状态机与 stale/cancel 规则。
 - [ ] 需要创建 Feature：Shell Resolver 与受限 x86 Dialog Adapter 边界。
 - [ ] 需要创建 Refactor：Legacy .NET/WPF Plugin Host 边界。
 - [ ] 需要创建 Feature：Renderer registry、manifest、supervisor policy 与 cache。
@@ -137,7 +139,7 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 
 ### 剩余阻碍
 
-- Rust Broker 的生产单实例规则、外部命令入口和完整请求状态转换尚未设计；Foundation 只验证了一个 Worker 的监督与过期结果拒绝。
+- Rust Broker 的单实例、外部 command ack 与纯请求状态转换已经验证；全局热键、真实 Shell 选择和 Resolver/Viewer effect adapter 尚未接入该 Runtime。
 - Shell Resolver、x86 Dialog Adapter、Viewer/Legacy Host 和 Renderer 的生产进程边界仍需按后续 Issue 逐项验证，不能从 WorkerProbe 直接外推。
 
 ## 暂不推进范围
@@ -172,6 +174,7 @@ Broker 统一管理以文件身份、修改时间和大小、Renderer ID/版本�
 - 旧插件通过 Legacy Host 保持兼容的长期策略。
 - Preview Protocol 的稳定术语、会话状态和错误恢复规则。
 - 已验证的协议 framing、当前用户 pipe 身份验证、只读句柄所有权和 Worker 回收边界。
+- 已验证的会话级单实例、typed command ack、有界过载语义和 Runtime 单一状态/effect 所有权。
 - 哪些格式由系统预览器、旧插件或 Rust Renderer 负责。
 
 ## 关闭回写

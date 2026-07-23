@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, Tokio Windows Named Pipes, `windows-sys` 0.61, Prost, Cargo unit/integration tests, PowerShell foundation gate.
 
-**Source of truth:** `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`, including the approved acceptance remediation. The supporting design is `docs/plans/2026-07-23-rust-broker-acceptance-remediation-design.md`.
+**Source of truth:** `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`, including the approved acceptance remediation. The supporting design is `docs/plans/2026-07-23-rust-broker-acceptance-remediation-design.md`.
 
 **Hard constraints:** Windows x64 only. Do not add ARM64 targets, branches, matrices, artifacts, test modes, or promises. Do not add Shell Resolver, Viewer, Renderer, x86 Dialog Adapter, commands, a second effect runner, or a second event/error vocabulary. Keep the Issue and behavior Explore open and the architecture Epic draft unless the user separately authorizes closing.
 
@@ -473,7 +473,7 @@ git commit -m "refactor: make broker runtime own session effects"
 
 **Files:**
 
-- Modify: `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`
+- Modify: `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`
 - Modify: `tools/test-foundation.ps1` only if the workspace test no longer reaches the moved security tests
 
 ### Step 1: Format, lint, and run focused suites
@@ -529,7 +529,7 @@ Record exact commands/counts for combined saturation and recovery, bounded queue
 ### Step 6: Commit the verified evidence
 
 ```powershell
-git add .cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md tools/test-foundation.ps1
+git add .cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md tools/test-foundation.ps1
 git commit -m "test: gate broker acceptance remediation"
 ```
 

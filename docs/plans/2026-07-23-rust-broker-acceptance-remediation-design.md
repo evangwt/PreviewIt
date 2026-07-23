@@ -2,7 +2,7 @@
 
 **Status:** Approved by the user on 2026-07-23.
 
-**Source of truth:** `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`. This document records the accepted remediation choice; the Issue remains authoritative when wording differs.
+**Source of truth:** `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`. This document records the accepted remediation choice; the Issue remains authoritative when wording differs.
 
 **Scope:** Fix the four acceptance findings in the x64 Broker control foundation. Keep the Issue and behavior Explore open and the architecture Epic draft. Do not add ARM64, Shell Resolver, Viewer, Renderer, x86 Dialog Adapter, commands, deployment, or publication work.
 
@@ -74,4 +74,3 @@ Queue and combined-capacity tests use clients whose connect/read/write operation
 - Existing contract, slow client, queue, decoder, shutdown, process election, Worker, and protocol suites.
 - Focused repetition followed by `tools/test-foundation.ps1`.
 - Only `x86_64-pc-windows-msvc` installed/configured; PE remains `8664 machine (x64)`; scoped ARM64 search remains empty.
-

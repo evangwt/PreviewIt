@@ -12,7 +12,7 @@
 
 ## Scope and execution rules
 
-- Work only on `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`.
+- Work only on `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`.
 - The worktree is `D:\Code\PreviewIt-foundation`; implementation branch is `feat/broker-instance-state-machine`.
 - Keep the Issue `open`, behavior-baseline Explore `open`, and architecture Epic `draft` until the user explicitly authorizes closure.
 - Keep `rust-toolchain.toml` limited to `x86_64-pc-windows-msvc`. Do not add ARM64 targets, conditionals, build jobs, artifacts, claims, or fallback behavior.
@@ -426,7 +426,7 @@ git commit -m "feat: run single-instance broker control loop"
 
 - Modify: `tools/test-foundation.ps1`
 - Modify: `.github/workflows/foundation.yml` only if the unchanged command cannot execute the new tests
-- Modify: `.cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md`
+- Modify: `.cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md`
 - Do not modify Epic/project spec during Do; closing authorization is still separate
 
 **Step 1: Add an explicit Broker process-test gate**
@@ -485,7 +485,7 @@ Do not change the Issue status or filename. Do not close the Explore or Epic. Do
 **Step 5: Commit the verified gate/evidence**
 
 ```powershell
-git add tools/test-foundation.ps1 .github/workflows/foundation.yml .cs/issues/2026/07/23/open-rust-broker-single-instance-request-state-machine.md
+git add tools/test-foundation.ps1 .github/workflows/foundation.yml .cs/issues/2026/07/23/closed-rust-broker-single-instance-request-state-machine.md
 git commit -m "test: gate broker instance state machine"
 git status --short --branch
 ```
