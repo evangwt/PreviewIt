@@ -536,4 +536,3 @@ git commit -m "test: gate broker acceptance remediation"
 ### Step 7: Stop for harsh review and explicit closing authorization
 
 Report every task commit, exact gate results, remaining scope, and unchanged CodeStable states. Run a new harsh acceptance review before requesting any authorization to close or graduate knowledge.
-

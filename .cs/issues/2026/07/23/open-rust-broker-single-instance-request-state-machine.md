@@ -49,9 +49,9 @@ epic: ".cs/epics/2026/07/20/rust-hybrid-preview-architecture/spec.md"
 
 当前 Broker 在控制面初始化前通过 session-scoped、current-user/SYSTEM Mutex 完成选主。主实例创建确定命名的 local-only Tokio Named Pipe endpoint；accept 后先补充 listener，再由 connection task 完成统一 4-byte LE framing、1 MiB 上限、Protobuf decode 和 `BrokerControlContract` 校验。合法请求只以 `PendingCommand { ValidatedCommand, reply }` 进入容量为 8 的队列；pipe handle 始终归 endpoint task，状态线程只持 reply handle。
 
-验收 review 证明现有容量公式并未覆盖真实 listener replacement：8 个 queued、1 个 active、4 个 decoding connection 和 1 个 standby listener 已占满 14 个 Win32 pipe instance；下一客户端可以连接现有 listener，但 endpoint 随后创建 replacement 时会命中 `ERROR_PIPE_BUSY` 并退出。现有 queue 与 decoder 测试分别通过，不能证明组合满载仍返回 `primary-busy` 或能够恢复。
+command endpoint 的容量现在显式包含 8 个 queued、1 个 active、4 个 decoding connection、1 个 admission/rejection reserve 和 1 个 standby listener，共 15 个 Win32 pipe instance。客户端接走 standby listener 后，replacement listener 即使在瞬时饱和时命中 `ERROR_PIPE_BUSY`，也只通过统一 `primary-busy` 路径拒绝该连接并重建 listener，不再终止 endpoint；组合满载测试同时占满 active、queue 与 decoder，并在拒绝后证明 endpoint 可以恢复 accepted round trip。
 
-`BrokerRuntime` 消费 `InstanceLease`、endpoint、`CommandRouter` 和唯一 `EventSink`，是 session state 的唯一所有者。Router 不再接触 Protobuf 或文件系统，但当前仍在内部把 `Cancel`/`Cleanup` effect 立即反馈为 `CleanupComplete`；Runtime 只消费 `StaleIgnored`，其他 effect 没有一个穷举的责任入口。Runtime 又只比较前后 phase，因此 `Resolving(request-1) -> Closing(request-1) -> Resolving(request-2)` 被压扁为同 phase，缺少真实的 replacement transition。显式 shutdown 先停止并 join endpoint，再释放 lease；Drop 复用同一幂等顺序。
+`BrokerRuntime` 消费 `InstanceLease`、endpoint、`CommandRouter` 和唯一 `EventSink`，是 session state 与 effect 的唯一所有者。Router 不接触 Protobuf、文件系统或 effect feedback，每次调用只执行一个 reducer step；Runtime 通过一个穷举 effect pump 消费所有 `SessionEffect`，当前只为没有真实执行资源的 `Cancel`/`Cleanup` 反馈一次 `CleanupComplete`。每个 reducer step 都按 `(phase, request_id)` 独立比较并发出 transition，因此 replacement 明确记录 `Resolving(request-1) -> Closing(request-1) -> Resolving(request-2)`。显式 shutdown 先停止并 join endpoint，再释放 lease；Drop 复用同一幂等顺序。
 
 次实例发送一次 command，并用同一个 contract 校验 response version、command ID 和 ack shape 后才决定退出码；如果 endpoint 从未出现且旧 owner 已退出，contender 可以取得 lease 并成为新 primary。`accepted=true` 只表示命令已经进入 Broker session，不表示路径存在或预览成功。UTF-16LE、NUL、长度和 absolute path 属于同步控制边界；存在性、访问权限和文件身份属于未来 Shell Resolver 驱动的 `Resolving` 异步事件。
 
@@ -175,18 +175,18 @@ second Broker process
 
 ### 当前收敛验证
 
-2026-07-23 的 acceptance review 判定以下 `43efb8c..1738f0e` 证据不足以关闭 Issue：独立 queue/decoder 通过没有覆盖组合实例上限；security 测试依赖 release raw handle；Runtime 没有成为 effect 的唯一所有者；queue 测试含无 deadline 的 `FlushFileBuffers`。这些结果仍是回归基线，但在 remediation 完成并重跑前不是关闭证据。
+2026-07-23 的 acceptance review 判定 `43efb8c..1738f0e` 证据不足以关闭 Issue：独立 queue/decoder 通过没有覆盖组合实例上限；security 测试依赖 release raw handle；Runtime 没有成为 effect 的唯一所有者；queue 测试含无 deadline 的 `FlushFileBuffers`。`1404001..ed37333` 已逐项修复这些根因，并按 remediation plan 重新建立以下证据；旧结果只保留为历史回归基线。
 
-- Contract 与 response validation：`cargo test --manifest-path src/rust/Cargo.toml -p previewit-broker --test broker_control_contract` 为 13/13。覆盖 command ID/version 校验顺序、奇数 UTF-16LE、embedded NUL、超长/相对路径、missing command、accepted/rejected shape、response version/ID mismatch 和 id-less `primary-busy`；非法 ID 不回显。absolute missing path 结构校验成功，不依赖文件 fixture。
-- Transport 与并发：`delayed_partial_frame_is_stably_truncated` 重复 100/100，pending read 断开稳定归一化为 `truncated-frame`；`broker_control_round_trips_open_path` 在计划要求的 100/100 后按 Issue 验证口径追加到 500/500；`one_slow_client_does_not_block_a_normal_command` 重复 20/20。`pipe.rs` 已无 `ReadFile`、`WriteFile`、`CancelIoEx`、`GetOverlappedResult`、`CANCELLATION_GRACE` 或旧 `connect_pipe` fallback。
-- 容量：`cargo test --manifest-path src/rust/Cargo.toml -p previewit-broker --test broker_control -- --test-threads=1` 为 14/14。`full_pending_queue_returns_stable_rejection` 重复 20/20，已解码队列满稳定返回 `queue-full`；`exhausted_decode_slots_report_primary_busy` 重复 20/20，四个 partial-frame client 占满 decoder 时稳定返回 `primary-busy`。两项测试都在客户端断开后完成新的 accepted round trip，证明容量恢复。
-- Lifecycle：`dropping_server_allows_immediate_same_name_recreation` 重复 20/20；`broker_runtime` 为 3/3，显式证明 `endpoint-stopped` 先于 `lease-released`，随后同 product ID 可以取得新 lease。endpoint shutdown 会停止 accept、abort/await connection task 并 join thread，不留 detached task/thread。
-- Runtime 与 path 语义：`command_routing` 为 5/5、`request_state_machine` 为 6/6、`broker_runtime` 为 3/3。absolute missing path 获得 accepted/request ID 并进入 `Resolving`；duplicate、phase、current failure 和 stale event 通过同一个 typed recorder 观察，事件不含完整路径。
-- Windows 安全：`command_pipe_security` 为 2/2。测试对真实 server handle 调用 `GetSecurityInfo` 并枚举 ACL，DACL ACE 排序后恰好为 `SYSTEM (S-1-5-18)` 与当前 token 用户；`GetHandleInformation` 证明 handle 不可继承；`GetNamedPipeInfo` 证明设置 `PIPE_REJECT_REMOTE_CLIENTS`；当前用户真实 client 完成 Close round trip。这里只验证了确定性的 remote-rejection flag，没有声称执行远程网络连接测试，也没有依赖 SMB、机器名、防火墙或第二 OS 用户。
-- 进程与回归：`broker_single_instance` 为 4/4，覆盖十进程只留下一个 primary、九个 secondary 接收 accepted ack、kill primary 后 crash takeover、held lease/no endpoint 的 `primary-not-ready`、参数先于选主校验和 PE x64。Worker handshake 5/5、read-only handle transfer 2/2、instance lease 4/4、supervision/stale 3/3 保持通过。
-- 完整 gate：`pwsh -NoProfile -File tools/test-foundation.ps1` 最终退出 `0`，实际输出 `QUICKLOOK_BASELINE_OK=b13df028f3cce1f84792f7043b57bf5cea3a3e4c`、`LEGACY_BUILD_OK`、`FOUNDATION_STEP=broker-single-instance` 和 `FOUNDATION_GATE_OK`。Gate 中 Broker 68 个测试、protocol 5 个测试、.NET protocol parity 6 个测试全部通过，rustfmt、workspace Clippy `-D warnings`、Release x64 Worker build、Broker build、legacy build 与 QuickLook provenance 均成功。workspace test 已覆盖新 security suite，因此 `tools/test-foundation.ps1` 无需修改。
-- Gate 诊断记录：第一次经工具直接启动 gate 时外层只返回无 stdout/stderr 的 `exit 1`，没有可定位失败步骤，未计为通过。未修改代码的情况下按 gate 原顺序逐步捕获，九个 step 全部通过；随后再次执行原始脚本明确返回 `0` 并产生上述完整标记。保留这条 runner-output 异常，不把它包装成测试失败或静默忽略。
-- x64-only：`rustup target list --installed` 只输出 `x86_64-pc-windows-msvc`；`rg -n "aarch64|ARM64" rust-toolchain.toml src/rust .github/workflows/foundation.yml tools/test-foundation.ps1` 无匹配；VS `dumpbin /headers src/rust/target/debug/previewit-broker.exe` 输出 `8664 machine (x64)`；`git diff 7e62a7b..HEAD --check` 通过。
+- Contract 与 response validation：`broker_control_contract` 为 13/13。覆盖 command ID/version 校验顺序、奇数 UTF-16LE、embedded NUL、超长/相对路径、missing command、accepted/rejected shape、response version/ID mismatch 和 id-less `primary-busy`；非法 ID 不回显。absolute missing path 结构校验成功，不依赖文件 fixture。
+- Transport 与并发：`delayed_partial_frame_is_stably_truncated` 的既有 100/100、`broker_control_round_trips_open_path` 的既有 500/500 和 `one_slow_client_does_not_block_a_normal_command` 的既有 20/20 继续由完整 workspace gate 覆盖。`pipe.rs` 仍无手写 Overlapped I/O 或第二套 framing。
+- 组合容量与恢复：`combined_capacity_rejects_without_stopping_endpoint` 在修复前稳定 RED 为 `Err(Transport(TruncatedControlFrame))`，修复后与 `broker_control` 全套 15/15 通过，并单独重复 20/20。它同时占满 active、8 个 queued 和 4 个 decoder，下一连接稳定得到 `primary-busy`，随后释放容量并完成 accepted round trip。`full_pending_queue_returns_stable_rejection` 与 `exhausted_decode_slots_report_primary_busy` 也各重复 20/20；前者返回 `queue-full`，后者返回 `primary-busy`，两者均证明恢复。测试通过有 deadline 的 `BrokerCommandClient` 和 `CommandQueueFull` event 协调，源码/测试均无 `FlushFileBuffers`。
+- Runtime effect 所有权：TDD RED 明确暴露 Router 提前越过 `Closing` 和 Runtime 压扁 replacement transition；GREEN 后 `command_routing` 5/5、`broker_runtime` 4/4、`request_state_machine` 6/6。Router 只返回一次 reducer effect；Runtime 的单一、穷举 pump 反馈 cleanup，并逐步记录 `(phase, request_id)` transition。`replacement_emits_each_transition_while_runtime_drives_cleanup` 单独重复 20/20，严格观察 accepted、`Resolving(old) -> Closing(old)`、`Closing(old) -> Resolving(next)` 三个事件。
+- Windows 安全与发布 API：安全检查已移入 `command.rs` 的 `#[cfg(test)]` module，由测试自己创建并拥有真实 server handle；`command_pipe_dacl_contains_only_system_and_current_user` 与 `command_pipe_rejects_remote_clients_and_allows_current_user` 为 2/2，所在 unit suite 为 9/9。测试仍用 `GetSecurityInfo`、ACL enumeration、`GetHandleInformation`、`GetNamedPipeInfo` 和当前 token SID 验证 SYSTEM/current-user DACL、不可继承、remote rejection 与真实 round trip。release `BrokerCommandServer` 不保存/返回 inspection raw handle，crate root 不导出 inspection SID helper；源码 guard 对 `inspection_handle|current_user_sid_for_inspection` 零匹配。没有声称执行远程网络连接测试。
+- Lifecycle、进程与回归：`broker_single_instance` 4/4，覆盖十进程单 primary、secondary ack、crash takeover、held lease/no endpoint、参数先校验和 PE x64；Worker handshake 5/5、read-only handle transfer 2/2、instance lease 4/4、supervision/stale 3/3。runtime shutdown 仍证明 `endpoint-stopped` 先于 `lease-released`，随后同 product ID 可以取得新 lease。
+- Focused gate：`cargo fmt --all -- --check`、workspace Clippy `--all-targets -- -D warnings` 和 `cargo test -p previewit-broker -- --test-threads=1` 均退出 0；Broker 共 70 个测试通过，Clippy 无警告。
+- 完整 gate：`pwsh -NoProfile -File tools/test-foundation.ps1` 最终退出 0，实际输出 `QUICKLOOK_BASELINE_OK=b13df028f3cce1f84792f7043b57bf5cea3a3e4c`、`LEGACY_BUILD_OK`、`FOUNDATION_STEP=broker-single-instance` 和 `FOUNDATION_GATE_OK`。Gate 中 Broker 70 个测试、protocol 5 个测试、.NET protocol parity 6 个测试全部通过；rustfmt、workspace Clippy `-D warnings`、Release x64 Worker build、Broker build、legacy build 与 QuickLook provenance 均成功。security unit tests 已由 workspace gate 覆盖，因此 `tools/test-foundation.ps1` 无需修改。
+- Gate 诊断记录：第一次经工具直接启动 gate 时外层只返回无 stdout/stderr 的 exit 1，没有可定位失败步骤，未计为通过。未修改生产代码的情况下按 gate 原顺序逐步捕获，九个 step 全部通过；随后再次执行原始脚本明确返回 0 并产生上述完整标记。保留这条 runner-output 异常，不把它包装成测试失败或静默忽略。
+- x64-only 与边界：`rustup target list --installed` 只输出 `x86_64-pc-windows-msvc`；ARM search 对 `rust-toolchain.toml`、`src/rust`、foundation workflow 和 gate 脚本零匹配；VS x64 `dumpbin /headers src/rust/target/debug/previewit-broker.exe` 输出 `8664 machine (x64)`；removed-boundary search 对 `inspection_handle|current_user_sid_for_inspection|FlushFileBuffers` 零匹配；`git diff 3ef0edc..HEAD --check` 通过。
 
 ### 历史证据：`7e62a7b`
 
@@ -203,7 +203,10 @@ Review 随后证明这些通过面没有覆盖四项根因：pending Overlapped 
 - Router（`a1ee580 refactor: keep broker routing pure`）：Router 只接收 `ValidatedCommand`，删除 Protobuf、路径 decode、版本常量和文件系统访问；absolute missing path 使用 approved async `Resolving` 语义，duplicate disposition 显式化。
 - Runtime（`e48b158 feat: centralize broker runtime events`）：`BrokerRuntime` 统一拥有 lease、endpoint、router 和 sink；`BrokerEvent::name()` 成为唯一事件词汇，main 不再维护 raw event 字符串或丢弃 effect。为避免复制 reducer，额外把 `CommandRouter::handle_event` 暴露为 crate-private 入口。
 - Security/capacity（`0461a4b test: prove broker command security boundaries`）：通过真实 Win32 handle/ACL/pipe flag 检查安全边界，并证明 queue/decoder saturation 与断开恢复。只增加非拥有型初始 listener handle 和当前用户 SID 的隐藏只读 inspection 入口，没有第二个 descriptor builder。
-- 最终验证（本次证据提交）：focused repetition、完整 foundation gate、x64 PE/target/ARM64 search 与 diff check 全部完成；新 security integration test 已由 workspace gate 覆盖，因此没有修改 gate 脚本。
+- 组合容量修复（`1404001 fix: preserve broker endpoint at full capacity`）：把真实 instance 预算修正为 15，replacement listener 饱和改为可恢复拒绝，并以组合满载/恢复测试覆盖；删除 queue 测试中的无界 `FlushFileBuffers`。
+- 安全接缝收敛（`50aadc8 test: hide broker pipe inspection from release api`）：删除 release inspection handle/SID API 与 integration seam，把真实 Win32 security characterization 移入 test-only module。
+- Runtime effect 收敛（`ed37333 refactor: make broker runtime own session effects`）：Router 只做一次 reducer step，Runtime 成为唯一 effect pump，并按每个 `(phase, request_id)` step 发出 transition。
+- 最终验证（本次证据提交）：focused suites、四个 hostile scenario 各 20/20、完整 foundation gate、x64 PE/target/ARM64 search、removed-boundary search 与 diff check 全部完成；security unit tests 已由 workspace gate 覆盖，因此没有修改 gate 脚本。
 - 范围保持：没有接入 Shell、热键、x86 Dialog Adapter、Viewer、Renderer、installer 或 updater；没有 ARM64 target、条件编译、产物或声明。Issue 继续保持 `open`，behavior-baseline Explore 继续保持 `open`，architecture Epic 继续保持 `draft`，等待用户明确授权关闭与毕业回写。
 - Acceptance review（2026-07-23）：发现组合满载会在 replacement listener 创建时停止 endpoint、release API 泄漏短生命周期 raw handle、effect feedback 仍在 Router 且 Runtime 丢弃多数 effect、queue 测试可在 `FlushFileBuffers` 无界挂起。用户确认采用结构收敛方案修复；原完整 gate 保留为历史回归证据，不代表 remediation 已完成。
 
@@ -215,7 +218,7 @@ Review 随后证明这些通过面没有覆盖四项根因：pending Overlapped 
 
 ## 关闭结论
 
-- 关闭判断：acceptance remediation 尚未实现与验证，Issue 不可关闭且状态保持 `open`。
-- 验证摘要：见“验证与历史证据”的当前收敛验证；`7e62a7b` 与 `1738f0e` 都只保留为各自阶段的历史证据，不能抵消当前 review blocker。
+- 关闭判断：acceptance remediation 已实现并通过当前技术门禁；仍须完成新的 harsh review，并且未经用户明确授权不得关闭，Issue 状态保持 `open`。
+- 验证摘要：见“验证与历史证据”的当前收敛验证；`7e62a7b` 与 `1738f0e` 只保留为各自阶段的历史证据，当前验收以 `1404001..本次证据提交` 为准。
 - 回写位置：获得用户关闭授权后，先把稳定的会话选主、command ack、状态不变量和 stale/event 边界回写所属 Epic；不自动关闭 Epic，也不提前写入 Project Spec。
 - 遗留事项：Shell Resolver、x86 Dialog Adapter、Viewer/Legacy Host、Renderer 和完整 CLI 命令目录不属于本 Issue。
