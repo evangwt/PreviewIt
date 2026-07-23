@@ -1,10 +1,26 @@
-use std::time::Duration;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::ptr::null_mut;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
-use previewit_broker::{BrokerCommandClient, BrokerCommandError, BrokerCommandServer};
+use previewit_broker::{
+    BrokerCommand, BrokerCommandClient, BrokerCommandError, BrokerCommandServer, CommandAck,
+    CommandRejectionCode,
+};
 use previewit_protocol::v0::{
     BrokerControlRequest, BrokerControlResponse, ClosePreview, OpenPath, broker_control_request,
 };
+use previewit_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, encode_frame};
+use prost::Message;
 use uuid::Uuid;
+use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -13,21 +29,30 @@ fn pipe_name(label: &str) -> String {
 }
 
 fn open_path_request() -> BrokerControlRequest {
-    let path = r"C:\fixtures\preview.txt";
+    request_with_path(
+        "command-1",
+        r"C:\fixtures\preview.txt"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+    )
+}
+
+fn close_request(command_id: &str) -> BrokerControlRequest {
     BrokerControlRequest {
-        protocol_major: 0,
-        protocol_minor: 1,
-        command_id: "command-1".into(),
-        command: Some(broker_control_request::Command::OpenPath(OpenPath {
-            path_utf16le: path.encode_utf16().flat_map(u16::to_le_bytes).collect(),
-        })),
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        command_id: command_id.into(),
+        command: Some(broker_control_request::Command::ClosePreview(
+            ClosePreview {},
+        )),
     }
 }
 
 fn accepted(command_id: &str, request_id: &str) -> BrokerControlResponse {
     BrokerControlResponse {
-        protocol_major: 0,
-        protocol_minor: 1,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
         command_id: command_id.into(),
         accepted: true,
         request_id: request_id.into(),
@@ -37,8 +62,8 @@ fn accepted(command_id: &str, request_id: &str) -> BrokerControlResponse {
 
 fn request_with_path(command_id: &str, path_utf16le: Vec<u8>) -> BrokerControlRequest {
     BrokerControlRequest {
-        protocol_major: 0,
-        protocol_minor: 1,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
         command_id: command_id.into(),
         command: Some(broker_control_request::Command::OpenPath(OpenPath {
             path_utf16le,
@@ -46,86 +71,270 @@ fn request_with_path(command_id: &str, path_utf16le: Vec<u8>) -> BrokerControlRe
     }
 }
 
+fn hold_partial_frame(
+    name: String,
+    ready: Sender<()>,
+    release: Receiver<()>,
+    connect_timeout: Duration,
+) -> bool {
+    let Some(mut pipe) = connect_raw_client(&name, connect_timeout) else {
+        return false;
+    };
+    pipe.write_all(&[10, 0, 0, 0, 1]).unwrap();
+    pipe.flush().unwrap();
+    ready.send(()).unwrap();
+    let _ = release.recv_timeout(TIMEOUT);
+    true
+}
+
+fn connect_raw_client(name: &str, connect_timeout: Duration) -> Option<File> {
+    let pipe_path = format!(r"\\.\pipe\{name}");
+    let deadline = Instant::now() + connect_timeout;
+    loop {
+        match OpenOptions::new().read(true).write(true).open(&pipe_path) {
+            Ok(pipe) => return Some(pipe),
+            Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn raw_round_trip(name: &str, request: &BrokerControlRequest) -> BrokerControlResponse {
+    let mut pipe = connect_raw_client(name, TIMEOUT).expect("raw client could not connect");
+    pipe.write_all(&encode_frame(&request.encode_to_vec()).unwrap())
+        .unwrap();
+    pipe.flush().unwrap();
+    read_response(&mut pipe)
+}
+
+fn read_response(pipe: &mut File) -> BrokerControlResponse {
+    let mut length = [0_u8; 4];
+    pipe.read_exact(&mut length).unwrap();
+    let mut payload = vec![0_u8; u32::from_le_bytes(length) as usize];
+    pipe.read_exact(&mut payload).unwrap();
+    BrokerControlResponse::decode(payload.as_slice()).unwrap()
+}
+
+#[test]
+fn one_slow_client_does_not_block_a_normal_command() {
+    let name = pipe_name("slow-client");
+    let server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
+    let (state_done_tx, state_done_rx) = mpsc::channel();
+    let state = std::thread::spawn(move || {
+        let pending = server.receive()?;
+        let command_id = pending.command().command_id().clone();
+        assert!(matches!(pending.command().command(), BrokerCommand::Close));
+        pending.respond(CommandAck::CloseAccepted { command_id })?;
+        state_done_rx
+            .recv_timeout(TIMEOUT)
+            .map_err(|_| BrokerCommandError::ListenerStopped)?;
+        Ok::<_, BrokerCommandError>(())
+    });
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let slow_name = name.clone();
+    let slow =
+        std::thread::spawn(move || hold_partial_frame(slow_name, ready_tx, release_rx, TIMEOUT));
+    ready_rx.recv_timeout(TIMEOUT).unwrap();
+
+    let started = Instant::now();
+    let response = BrokerCommandClient::send(
+        &name,
+        &close_request("command-normal"),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
+    let elapsed = started.elapsed();
+
+    state_done_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+    assert!(slow.join().unwrap());
+    state.join().unwrap().unwrap();
+
+    assert!(elapsed < Duration::from_millis(500));
+    assert!(matches!(
+        response.unwrap(),
+        CommandAck::CloseAccepted { .. }
+    ));
+}
+
+#[test]
+fn exhausted_decode_slots_report_primary_busy() {
+    const DECODE_SLOTS: usize = 4;
+
+    let name = pipe_name("decode-busy");
+    let server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let mut releases = Vec::new();
+    let mut clients = Vec::new();
+    for _ in 0..DECODE_SLOTS {
+        let (release_tx, release_rx) = mpsc::channel();
+        releases.push(release_tx);
+        let client_name = name.clone();
+        let client_ready = ready_tx.clone();
+        clients.push(std::thread::spawn(move || {
+            hold_partial_frame(
+                client_name,
+                client_ready,
+                release_rx,
+                Duration::from_millis(750),
+            )
+        }));
+    }
+    drop(ready_tx);
+
+    let readiness_deadline = Instant::now() + Duration::from_millis(750);
+    let mut ready_count = 0;
+    while ready_count < DECODE_SLOTS {
+        let Some(remaining) = readiness_deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if ready_rx.recv_timeout(remaining).is_err() {
+            break;
+        }
+        ready_count += 1;
+    }
+
+    let busy = if ready_count == DECODE_SLOTS {
+        BrokerCommandClient::send(
+            &name,
+            &close_request("command-busy"),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+        .expect_err("an exhausted endpoint must reject before routing")
+    } else {
+        BrokerCommandError::PrimaryNotReady
+    };
+
+    drop(server);
+    for release in releases {
+        let _ = release.send(());
+    }
+    for client in clients {
+        let _ = client.join();
+    }
+
+    assert_eq!(ready_count, DECODE_SLOTS);
+    assert!(
+        matches!(busy, BrokerCommandError::PrimaryBusy),
+        "unexpected error: {busy:?}"
+    );
+    assert_eq!(busy.code(), "primary-busy");
+}
+
+#[test]
+fn dropping_server_allows_immediate_same_name_recreation() {
+    let name = pipe_name("drop-recreate");
+    drop(BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap());
+
+    BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
+}
+
+#[test]
+fn client_rejects_mismatched_response_id() {
+    let name = pipe_name("wrong-response-id");
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let server_name = name.clone();
+    let server = std::thread::spawn(move || {
+        let mut pipe = create_raw_server(&server_name);
+        ready_tx.send(()).unwrap();
+        connect_raw_server(&pipe);
+        let mut length = [0_u8; 4];
+        pipe.read_exact(&mut length).unwrap();
+        let mut request = vec![0_u8; u32::from_le_bytes(length) as usize];
+        pipe.read_exact(&mut request).unwrap();
+        let response = accepted("different-command", "request-1");
+        pipe.write_all(&encode_frame(&response.encode_to_vec()).unwrap())
+            .unwrap();
+        pipe.flush().unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let error = BrokerCommandClient::send(&name, &open_path_request(), TIMEOUT, TIMEOUT)
+        .expect_err("a response for another command must be rejected");
+
+    assert_eq!(error.code(), "response-command-mismatch");
+    server.join().unwrap();
+}
+
 #[test]
 fn broker_control_round_trips_open_path() {
     let name = pipe_name("open");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        let request = server.receive_request().unwrap();
-        server
-            .send_response(&accepted(&request.command_id, "request-1"))
-            .unwrap();
-        request
+    let server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
+    let client_name = name.clone();
+    let client = std::thread::spawn(move || {
+        BrokerCommandClient::send(&client_name, &open_path_request(), TIMEOUT, TIMEOUT)
     });
+    let pending = server.receive().unwrap();
+    assert!(matches!(
+        pending.command().command(),
+        BrokerCommand::Open(_)
+    ));
+    let command_id = pending.command().command_id().clone();
+    pending
+        .respond(CommandAck::OpenAccepted {
+            command_id,
+            request_id: "request-1".into(),
+        })
+        .unwrap();
 
-    let request = open_path_request();
-    let response = BrokerCommandClient::send(&name, &request, TIMEOUT, TIMEOUT).unwrap();
+    let response = client.join().unwrap().unwrap();
 
-    assert!(response.accepted);
-    assert_eq!(response.command_id, "command-1");
-    assert_eq!(response.request_id, "request-1");
-    assert_eq!(server.join().unwrap(), request);
+    assert!(matches!(
+        response,
+        CommandAck::OpenAccepted { ref request_id, .. } if request_id == "request-1"
+    ));
 }
 
 #[test]
 fn broker_control_round_trips_close_preview() {
     let name = pipe_name("close");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        let request = server.receive_request().unwrap();
-        server
-            .send_response(&accepted(&request.command_id, ""))
-            .unwrap();
-        request
+    let server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
+    let client_name = name.clone();
+    let client = std::thread::spawn(move || {
+        BrokerCommandClient::send(
+            &client_name,
+            &close_request("command-close"),
+            TIMEOUT,
+            TIMEOUT,
+        )
     });
+    let pending = server.receive().unwrap();
+    assert!(matches!(pending.command().command(), BrokerCommand::Close));
+    let command_id = pending.command().command_id().clone();
+    pending
+        .respond(CommandAck::CloseAccepted { command_id })
+        .unwrap();
 
-    let request = BrokerControlRequest {
-        protocol_major: 0,
-        protocol_minor: 1,
-        command_id: "command-close".into(),
-        command: Some(broker_control_request::Command::ClosePreview(
-            ClosePreview {},
-        )),
-    };
-    let response = BrokerCommandClient::send(&name, &request, TIMEOUT, TIMEOUT).unwrap();
+    let response = client.join().unwrap().unwrap();
 
-    assert!(response.accepted);
-    assert!(response.request_id.is_empty());
-    assert_eq!(server.join().unwrap(), request);
+    assert!(matches!(response, CommandAck::CloseAccepted { .. }));
 }
 
 #[test]
 fn wrong_protocol_major_returns_stable_rejection() {
     let name = pipe_name("wrong-major");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        server.receive_request()
-    });
-
+    let _server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
     let mut request = open_path_request();
     request.protocol_major = 1;
+
     let response = BrokerCommandClient::send(&name, &request, TIMEOUT, TIMEOUT).unwrap();
 
-    assert!(!response.accepted);
-    assert_eq!(response.command_id, "command-1");
-    assert_eq!(response.error_code, "protocol-major-mismatch");
     assert!(matches!(
-        server.join().unwrap(),
-        Err(BrokerCommandError::ProtocolMajorMismatch { .. })
+        response,
+        CommandAck::Rejected {
+            reason: CommandRejectionCode::ProtocolMajorMismatch,
+            ..
+        }
     ));
 }
 
 #[test]
 fn invalid_utf16_path_returns_stable_rejection() {
     let name = pipe_name("invalid-utf16");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        server.receive_request()
-    });
+    let _server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
 
     let response = BrokerCommandClient::send(
         &name,
@@ -135,24 +344,21 @@ fn invalid_utf16_path_returns_stable_rejection() {
     )
     .unwrap();
 
-    assert!(!response.accepted);
-    assert_eq!(response.error_code, "invalid-utf16");
     assert!(matches!(
-        server.join().unwrap(),
-        Err(BrokerCommandError::InvalidUtf16)
+        response,
+        CommandAck::Rejected {
+            reason: CommandRejectionCode::InvalidUtf16,
+            ..
+        }
     ));
 }
 
 #[test]
 fn embedded_nul_path_returns_stable_rejection() {
     let name = pipe_name("embedded-nul");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        server.receive_request()
-    });
-
+    let _server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
     let path = "C:\\fixtures\\bad\0.txt";
+
     let response = BrokerCommandClient::send(
         &name,
         &request_with_path(
@@ -164,24 +370,21 @@ fn embedded_nul_path_returns_stable_rejection() {
     )
     .unwrap();
 
-    assert!(!response.accepted);
-    assert_eq!(response.error_code, "embedded-nul");
     assert!(matches!(
-        server.join().unwrap(),
-        Err(BrokerCommandError::EmbeddedNul)
+        response,
+        CommandAck::Rejected {
+            reason: CommandRejectionCode::EmbeddedNul,
+            ..
+        }
     ));
 }
 
 #[test]
 fn overlong_path_returns_stable_rejection_without_echoing_path() {
     let name = pipe_name("overlong-path");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        server.receive_request()
-    });
-
+    let _server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
     let path = "C:\\".to_owned() + &"x".repeat(32_768);
+
     let response = BrokerCommandClient::send(
         &name,
         &request_with_path(
@@ -193,25 +396,21 @@ fn overlong_path_returns_stable_rejection_without_echoing_path() {
     )
     .unwrap();
 
-    assert!(!response.accepted);
-    assert_eq!(response.error_code, "path-too-long");
-    assert!(response.request_id.is_empty());
     assert!(matches!(
-        server.join().unwrap(),
-        Err(BrokerCommandError::PathTooLong)
+        response,
+        CommandAck::Rejected {
+            reason: CommandRejectionCode::PathTooLong,
+            ..
+        }
     ));
 }
 
 #[test]
 fn missing_command_id_returns_stable_rejection() {
     let name = pipe_name("missing-command-id");
-    let server_name = name.clone();
-    let server = std::thread::spawn(move || {
-        let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        server.receive_request()
-    });
+    let _server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
 
-    let response = BrokerCommandClient::send(
+    let response = raw_round_trip(
         &name,
         &request_with_path(
             "",
@@ -220,17 +419,11 @@ fn missing_command_id_returns_stable_rejection() {
                 .flat_map(u16::to_le_bytes)
                 .collect(),
         ),
-        TIMEOUT,
-        TIMEOUT,
-    )
-    .unwrap();
+    );
 
     assert!(!response.accepted);
     assert_eq!(response.error_code, "invalid-command-id");
-    assert!(matches!(
-        server.join().unwrap(),
-        Err(BrokerCommandError::InvalidCommandId)
-    ));
+    assert!(response.command_id.is_empty());
 }
 
 #[test]
@@ -253,7 +446,7 @@ fn response_deadline_is_bounded() {
     let server_name = name.clone();
     let server = std::thread::spawn(move || {
         let server = BrokerCommandServer::create(&server_name, TIMEOUT, TIMEOUT).unwrap();
-        let _request = server.receive_request().unwrap();
+        let _pending = server.receive().unwrap();
         std::thread::sleep(Duration::from_millis(250));
     });
 
@@ -289,9 +482,13 @@ fn full_pending_queue_returns_stable_rejection() {
 
     std::thread::sleep(Duration::from_millis(200));
     for _ in 0..QUEUE_CAPACITY {
-        let request = server.receive_request().unwrap();
-        server
-            .send_response(&accepted(&request.command_id, "request-queued"))
+        let pending = server.receive().unwrap();
+        let command_id = pending.command().command_id().clone();
+        pending
+            .respond(CommandAck::OpenAccepted {
+                command_id,
+                request_id: "request-queued".into(),
+            })
             .unwrap();
     }
 
@@ -302,15 +499,48 @@ fn full_pending_queue_returns_stable_rejection() {
     assert_eq!(
         responses
             .iter()
-            .filter(|response| response.accepted)
+            .filter(|response| matches!(response, CommandAck::OpenAccepted { .. }))
             .count(),
         QUEUE_CAPACITY
     );
     assert_eq!(
         responses
             .iter()
-            .filter(|response| response.error_code == "queue-full")
+            .filter(|response| matches!(
+                response,
+                CommandAck::Rejected {
+                    reason: CommandRejectionCode::QueueFull,
+                    ..
+                }
+            ))
             .count(),
         1
     );
+}
+
+fn create_raw_server(name: &str) -> File {
+    let full_name = wide(&format!(r"\\.\pipe\{name}"));
+    let handle = unsafe {
+        CreateNamedPipeW(
+            full_name.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            64 * 1024,
+            64 * 1024,
+            0,
+            null_mut(),
+        )
+    };
+    assert_ne!(handle, INVALID_HANDLE_VALUE);
+    unsafe { File::from_raw_handle(handle) }
+}
+
+fn connect_raw_server(pipe: &File) {
+    let connected = unsafe { ConnectNamedPipe(pipe.as_raw_handle().cast(), null_mut()) };
+    assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
 }

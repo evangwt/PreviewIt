@@ -8,7 +8,7 @@ pub mod session;
 pub mod supervisor;
 mod windows_security;
 
-pub use command::{BrokerCommandClient, BrokerCommandError, BrokerCommandServer};
+pub use command::{BrokerCommandClient, BrokerCommandError, BrokerCommandServer, PendingCommand};
 pub use control::{
     BrokerCommand, BrokerControlContract, CommandAck, CommandId, CommandRejection,
     CommandRejectionCode, ExpectedAck, InvalidCommandResponse, ValidatedCommand,

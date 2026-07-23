@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use previewit_broker::{
-    BrokerCommandClient, BrokerCommandError, BrokerCommandServer, CommandRouter, InstanceLease,
-    InstanceRole,
+    BrokerCommandClient, BrokerCommandError, BrokerCommandServer, BrokerControlContract,
+    CommandRouter, InstanceLease, InstanceRole,
 };
 use previewit_protocol::v0::{
     BrokerControlRequest, BrokerControlResponse, ClosePreview, OpenPath, broker_control_request,
@@ -138,7 +138,8 @@ fn run_secondary(
     };
 
     match BrokerCommandClient::send(contender.pipe_name(), &command, STARTUP_TIMEOUT, IO_TIMEOUT) {
-        Ok(response) => {
+        Ok(ack) => {
+            let response = BrokerControlContract::encode_response(&ack);
             print_response("secondary", &response);
             accepted_exit(response.accepted)
         }

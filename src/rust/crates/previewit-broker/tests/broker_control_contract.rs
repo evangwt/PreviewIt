@@ -7,6 +7,7 @@ use previewit_broker::{
 use previewit_protocol::v0::{
     BrokerControlRequest, BrokerControlResponse, ClosePreview, OpenPath, broker_control_request,
 };
+use previewit_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 
 fn wire_close(command_id: &str, protocol_major: u32, protocol_minor: u32) -> BrokerControlRequest {
     BrokerControlRequest {
@@ -242,6 +243,42 @@ fn rejected_ack_round_trips_through_the_contract() {
         BrokerControlContract::decode_response(&ExpectedAck::open(command_id), wire).unwrap();
 
     assert_eq!(decoded, ack);
+}
+
+#[test]
+fn idless_rejection_is_reserved_for_primary_busy() {
+    let expected = ExpectedAck::close(CommandId::parse("command-1").unwrap());
+    let busy = BrokerControlResponse {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        command_id: String::new(),
+        accepted: false,
+        request_id: String::new(),
+        error_code: "primary-busy".into(),
+    };
+
+    assert!(matches!(
+        BrokerControlContract::decode_response(&expected, busy).unwrap(),
+        CommandAck::Rejected {
+            command_id: None,
+            reason: CommandRejectionCode::PrimaryBusy,
+        }
+    ));
+
+    let invalid = BrokerControlResponse {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        command_id: String::new(),
+        accepted: false,
+        request_id: String::new(),
+        error_code: "queue-full".into(),
+    };
+    assert_eq!(
+        BrokerControlContract::decode_response(&expected, invalid)
+            .unwrap_err()
+            .code(),
+        "response-command-id-invalid"
+    );
 }
 
 #[test]

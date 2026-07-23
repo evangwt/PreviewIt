@@ -64,6 +64,10 @@ pub enum CommandRejectionCode {
     EmbeddedNul,
     PathTooLong,
     PathNotAbsolute,
+    PathNotFound,
+    InvalidProtobuf,
+    FrameTooLarge,
+    PrimaryBusy,
     QueueFull,
 }
 
@@ -78,6 +82,10 @@ impl CommandRejectionCode {
             Self::EmbeddedNul => "embedded-nul",
             Self::PathTooLong => "path-too-long",
             Self::PathNotAbsolute => "path-not-absolute",
+            Self::PathNotFound => "path-not-found",
+            Self::InvalidProtobuf => "invalid-protobuf",
+            Self::FrameTooLarge => "frame-too-large",
+            Self::PrimaryBusy => "primary-busy",
             Self::QueueFull => "queue-full",
         }
     }
@@ -92,6 +100,10 @@ impl CommandRejectionCode {
             "embedded-nul" => Self::EmbeddedNul,
             "path-too-long" => Self::PathTooLong,
             "path-not-absolute" => Self::PathNotAbsolute,
+            "path-not-found" => Self::PathNotFound,
+            "invalid-protobuf" => Self::InvalidProtobuf,
+            "frame-too-large" => Self::FrameTooLarge,
+            "primary-busy" => Self::PrimaryBusy,
             "queue-full" => Self::QueueFull,
             _ => return None,
         })
@@ -267,6 +279,19 @@ impl BrokerControlContract {
         }
         if response.protocol_minor != PROTOCOL_MINOR {
             return Err(InvalidCommandResponse::ProtocolMinorMismatch);
+        }
+
+        if response.command_id.is_empty() {
+            if !response.accepted
+                && response.request_id.is_empty()
+                && response.error_code == CommandRejectionCode::PrimaryBusy.as_str()
+            {
+                return Ok(CommandAck::Rejected {
+                    command_id: None,
+                    reason: CommandRejectionCode::PrimaryBusy,
+                });
+            }
+            return Err(InvalidCommandResponse::InvalidCommandId);
         }
 
         let command_id = CommandId::parse(response.command_id)

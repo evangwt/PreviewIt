@@ -1,8 +1,6 @@
 use std::io;
-use std::mem::zeroed;
 use std::os::windows::io::AsRawHandle;
-use std::ptr::{null, null_mut};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use previewit_protocol::v0::{Envelope, HelloAck, envelope};
 use previewit_protocol::{MAX_CONTROL_FRAME, PROTOCOL_MAJOR, PROTOCOL_MINOR, encode_frame};
@@ -13,20 +11,13 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::timeout;
 use uuid::Uuid;
-use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, GetNamedPipeClientProcessId};
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
-use crate::windows_security::{CurrentUserSecurity, OwnedHandle, WindowsSecurityError};
+use crate::windows_security::{CurrentUserSecurity, WindowsSecurityError};
 
 const REQUIRED_CAPABILITY: &str = "read-handle-v0";
 const PIPE_BUFFER_SIZE: u32 = (MAX_CONTROL_FRAME + 4) as u32;
-const CANCELLATION_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum BrokerError {
@@ -217,7 +208,7 @@ impl PipeServer {
             io_timeout,
             ..
         } = self;
-        runtime.block_on(read_frame_async(handle, *io_timeout))
+        runtime.block_on(read_frame(handle, *io_timeout))
     }
 
     fn write_frame(&mut self, payload: &[u8]) -> Result<(), BrokerError> {
@@ -227,14 +218,11 @@ impl PipeServer {
             io_timeout,
             ..
         } = self;
-        runtime.block_on(write_frame_async(handle, payload, *io_timeout))
+        runtime.block_on(write_frame(handle, payload, *io_timeout))
     }
 }
 
-pub(crate) async fn read_frame_async<T>(
-    io: &mut T,
-    io_timeout: Duration,
-) -> Result<Vec<u8>, BrokerError>
+pub(crate) async fn read_frame<T>(io: &mut T, io_timeout: Duration) -> Result<Vec<u8>, BrokerError>
 where
     T: AsyncRead + Unpin,
 {
@@ -261,7 +249,7 @@ where
     }
 }
 
-pub(crate) async fn write_frame_async<T>(
+pub(crate) async fn write_frame<T>(
     io: &mut T,
     payload: &[u8],
     io_timeout: Duration,
@@ -273,7 +261,7 @@ where
     match timeout(io_timeout, io.write_all(&frame)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(source)) => Err(BrokerError::Windows {
-            operation: "WriteFile",
+            operation: "write pipe frame",
             source,
         }),
         Err(_) => Err(BrokerError::WriteTimeout),
@@ -288,206 +276,10 @@ fn normalize_read_error(source: io::Error) -> BrokerError {
         BrokerError::TruncatedControlFrame
     } else {
         BrokerError::Windows {
-            operation: "ReadFile",
+            operation: "read pipe frame",
             source,
         }
     }
-}
-
-pub(crate) fn connect_pipe(handle: HANDLE, startup_timeout: Duration) -> Result<(), BrokerError> {
-    let event = create_event()?;
-    let mut overlapped = Box::new(unsafe { zeroed::<OVERLAPPED>() });
-    overlapped.hEvent = event.raw();
-
-    let connected = unsafe { ConnectNamedPipe(handle, overlapped.as_mut()) };
-    if connected != 0 {
-        return Ok(());
-    }
-
-    let error = unsafe { GetLastError() };
-    if error == ERROR_PIPE_CONNECTED {
-        return Ok(());
-    }
-    if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
-        return Err(BrokerError::TruncatedControlFrame);
-    }
-    if error != ERROR_IO_PENDING {
-        return Err(error_code("ConnectNamedPipe", error));
-    }
-
-    wait_for_overlapped(
-        handle,
-        overlapped,
-        event,
-        startup_timeout,
-        BrokerError::StartupTimeout,
-        "GetOverlappedResult(ConnectNamedPipe)",
-    )?;
-    Ok(())
-}
-
-pub(crate) fn read_frame(handle: HANDLE, io_timeout: Duration) -> Result<Vec<u8>, BrokerError> {
-    let deadline = Instant::now() + io_timeout;
-    let mut length_bytes = [0_u8; 4];
-    read_exact(handle, &mut length_bytes, deadline)?;
-    let declared = u32::from_le_bytes(length_bytes) as usize;
-    if declared > MAX_CONTROL_FRAME {
-        return Err(BrokerError::ControlFrameTooLarge { declared });
-    }
-
-    let mut payload = vec![0_u8; declared];
-    read_exact(handle, &mut payload, deadline)?;
-    Ok(payload)
-}
-
-fn read_exact(handle: HANDLE, buffer: &mut [u8], deadline: Instant) -> Result<(), BrokerError> {
-    let mut offset = 0;
-    while offset < buffer.len() {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BrokerError::ReadTimeout)?;
-        let read = read_once(handle, &mut buffer[offset..], timeout)?;
-        if read == 0 {
-            return Err(BrokerError::TruncatedControlFrame);
-        }
-        offset += read;
-    }
-    Ok(())
-}
-
-fn read_once(handle: HANDLE, buffer: &mut [u8], timeout: Duration) -> Result<usize, BrokerError> {
-    let event = create_event()?;
-    let mut overlapped = Box::new(unsafe { zeroed::<OVERLAPPED>() });
-    overlapped.hEvent = event.raw();
-    let length = u32::try_from(buffer.len()).expect("control frame is bounded by 1 MiB");
-
-    let started = unsafe {
-        ReadFile(
-            handle,
-            buffer.as_mut_ptr().cast(),
-            length,
-            null_mut(),
-            overlapped.as_mut(),
-        )
-    };
-    if started == 0 {
-        let error = unsafe { GetLastError() };
-        if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
-            return Ok(0);
-        }
-        if error != ERROR_IO_PENDING {
-            return Err(error_code("ReadFile", error));
-        }
-    }
-
-    wait_for_overlapped(
-        handle,
-        overlapped,
-        event,
-        timeout,
-        BrokerError::ReadTimeout,
-        "GetOverlappedResult(ReadFile)",
-    )
-    .map(|read| read as usize)
-}
-
-pub(crate) fn write_frame(
-    handle: HANDLE,
-    payload: &[u8],
-    io_timeout: Duration,
-) -> Result<(), BrokerError> {
-    let frame = encode_frame(payload)?;
-    let deadline = Instant::now() + io_timeout;
-    let mut offset = 0;
-    while offset < frame.len() {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BrokerError::WriteTimeout)?;
-        let written = write_once(handle, &frame[offset..], timeout)?;
-        if written == 0 {
-            return Err(error_code("WriteFile", 0));
-        }
-        offset += written;
-    }
-    Ok(())
-}
-
-fn write_once(handle: HANDLE, buffer: &[u8], timeout: Duration) -> Result<usize, BrokerError> {
-    let event = create_event()?;
-    let mut overlapped = Box::new(unsafe { zeroed::<OVERLAPPED>() });
-    overlapped.hEvent = event.raw();
-    let length = u32::try_from(buffer.len()).expect("control frame is bounded by 1 MiB");
-
-    let started = unsafe {
-        WriteFile(
-            handle,
-            buffer.as_ptr().cast(),
-            length,
-            null_mut(),
-            overlapped.as_mut(),
-        )
-    };
-    if started == 0 {
-        let error = unsafe { GetLastError() };
-        if error != ERROR_IO_PENDING {
-            return Err(error_code("WriteFile", error));
-        }
-    }
-
-    wait_for_overlapped(
-        handle,
-        overlapped,
-        event,
-        timeout,
-        BrokerError::WriteTimeout,
-        "GetOverlappedResult(WriteFile)",
-    )
-    .map(|written| written as usize)
-}
-
-fn create_event() -> Result<OwnedHandle, BrokerError> {
-    let handle = unsafe { CreateEventW(null(), 1, 0, null()) };
-    if handle.is_null() {
-        Err(last_error("CreateEventW"))
-    } else {
-        Ok(OwnedHandle::new(handle))
-    }
-}
-
-fn wait_for_overlapped(
-    handle: HANDLE,
-    mut overlapped: Box<OVERLAPPED>,
-    event: OwnedHandle,
-    timeout: Duration,
-    timeout_error: BrokerError,
-    result_operation: &'static str,
-) -> Result<u32, BrokerError> {
-    let wait = unsafe { WaitForSingleObject(event.raw(), timeout_ms(timeout)) };
-    if wait == WAIT_TIMEOUT {
-        unsafe {
-            CancelIoEx(handle, overlapped.as_mut());
-        }
-        if unsafe { WaitForSingleObject(event.raw(), timeout_ms(CANCELLATION_GRACE)) }
-            != WAIT_OBJECT_0
-        {
-            std::mem::forget(overlapped);
-            std::mem::forget(event);
-        }
-        return Err(timeout_error);
-    }
-    if wait != WAIT_OBJECT_0 {
-        return Err(last_error("WaitForSingleObject"));
-    }
-
-    let mut transferred = 0;
-    if unsafe { GetOverlappedResult(handle, overlapped.as_mut(), &mut transferred, 0) } == 0 {
-        return Err(last_error(result_operation));
-    }
-    Ok(transferred)
-}
-
-fn timeout_ms(duration: Duration) -> u32 {
-    duration.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
 fn last_error(operation: &'static str) -> BrokerError {
@@ -497,18 +289,12 @@ fn last_error(operation: &'static str) -> BrokerError {
     }
 }
 
-fn error_code(operation: &'static str, code: u32) -> BrokerError {
-    BrokerError::Windows {
-        operation,
-        source: io::Error::from_raw_os_error(code as i32),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::thread;
+    use std::time::Instant;
 
     use super::*;
 
