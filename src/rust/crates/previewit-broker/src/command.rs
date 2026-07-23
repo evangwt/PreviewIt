@@ -1,4 +1,5 @@
 use std::io;
+use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
@@ -116,6 +117,7 @@ pub struct BrokerCommandServer {
     shutdown: Option<oneshot::Sender<()>>,
     endpoint_thread: Option<JoinHandle<()>>,
     receive_timeout: Duration,
+    inspection_handle: usize,
 }
 
 impl BrokerCommandServer {
@@ -152,11 +154,12 @@ impl BrokerCommandServer {
             .map_err(|source| transport_error("spawn command endpoint", source))?;
 
         match ready_receiver.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(inspection_handle)) => Ok(Self {
                 receiver,
                 shutdown: Some(shutdown),
                 endpoint_thread: Some(endpoint_thread),
                 receive_timeout: startup_timeout,
+                inspection_handle,
             }),
             Ok(Err(error)) => {
                 let _ = endpoint_thread.join();
@@ -176,6 +179,13 @@ impl BrokerCommandServer {
                 RecvTimeoutError::Timeout => BrokerError::StartupTimeout.into(),
                 RecvTimeoutError::Disconnected => BrokerCommandError::ListenerStopped,
             })
+    }
+
+    #[doc(hidden)]
+    /// Returns a non-owning value for the initial listener handle.
+    /// It is only valid before the first client connects and before shutdown.
+    pub fn inspection_handle(&self) -> usize {
+        self.inspection_handle
     }
 
     pub fn shutdown(&mut self) -> Result<(), BrokerCommandError> {
@@ -227,7 +237,7 @@ fn endpoint_thread_main(
     io_timeout: Duration,
     sender: SyncSender<PendingCommand>,
     shutdown: oneshot::Receiver<()>,
-    ready: SyncSender<Result<(), BrokerCommandError>>,
+    ready: SyncSender<Result<usize, BrokerCommandError>>,
     events: Arc<dyn EventSink>,
 ) {
     let runtime = match Builder::new_current_thread()
@@ -260,7 +270,8 @@ fn endpoint_thread_main(
                 return;
             }
         };
-        if ready.send(Ok(())).is_err() {
+        let inspection_handle = listener.as_raw_handle() as usize;
+        if ready.send(Ok(inspection_handle)).is_err() {
             return;
         }
 

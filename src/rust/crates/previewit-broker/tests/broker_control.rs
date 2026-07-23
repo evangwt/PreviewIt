@@ -3,11 +3,12 @@ use std::io::{Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr::null_mut;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use previewit_broker::{
-    BrokerCommand, BrokerCommandClient, BrokerCommandError, BrokerCommandServer, CommandAck,
-    CommandRejectionCode,
+    BrokerCommand, BrokerCommandClient, BrokerCommandError, BrokerCommandServer, BrokerEvent,
+    CommandAck, CommandRejectionCode, EventSink,
 };
 use previewit_protocol::v0::{
     BrokerControlRequest, BrokerControlResponse, ClosePreview, OpenPath, broker_control_request,
@@ -16,13 +17,25 @@ use previewit_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, encode_frame};
 use prost::Message;
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_DUPLEX,
+};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+
+struct QueueFullSignal(Mutex<Sender<()>>);
+
+impl EventSink for QueueFullSignal {
+    fn emit(&self, event: &BrokerEvent) {
+        if matches!(event, BrokerEvent::CommandQueueFull { .. }) {
+            let _ = self.0.lock().unwrap().send(());
+        }
+    }
+}
 
 fn pipe_name(label: &str) -> String {
     format!("PreviewIt.Test.{label}.{}", Uuid::new_v4().simple())
@@ -113,6 +126,15 @@ fn read_response(pipe: &mut File) -> BrokerControlResponse {
     let mut payload = vec![0_u8; u32::from_le_bytes(length) as usize];
     pipe.read_exact(&mut payload).unwrap();
     BrokerControlResponse::decode(payload.as_slice()).unwrap()
+}
+
+fn wait_until_server_reads_request(pipe: &File) {
+    assert_ne!(
+        unsafe { FlushFileBuffers(pipe.as_raw_handle()) },
+        0,
+        "FlushFileBuffers failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 #[test]
@@ -208,7 +230,6 @@ fn exhausted_decode_slots_report_primary_busy() {
         BrokerCommandError::PrimaryNotReady
     };
 
-    drop(server);
     for release in releases {
         let _ = release.send(());
     }
@@ -222,6 +243,32 @@ fn exhausted_decode_slots_report_primary_busy() {
         "unexpected error: {busy:?}"
     );
     assert_eq!(busy.code(), "primary-busy");
+
+    let (state_done_tx, state_done_rx) = mpsc::channel();
+    let state = std::thread::spawn(move || {
+        let pending = server.receive().unwrap();
+        let command_id = pending.command().command_id().clone();
+        pending
+            .respond(CommandAck::CloseAccepted { command_id })
+            .unwrap();
+        state_done_rx.recv_timeout(TIMEOUT).unwrap();
+    });
+    let recovery_deadline = Instant::now() + TIMEOUT;
+    let mut attempt = 0;
+    let recovered = loop {
+        let request = close_request(&format!("command-recovered-{attempt}"));
+        match BrokerCommandClient::send(&name, &request, TIMEOUT, TIMEOUT) {
+            Ok(ack) => break ack,
+            Err(BrokerCommandError::PrimaryBusy) if Instant::now() < recovery_deadline => {
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("decoder capacity did not recover: {error:?}"),
+        }
+    };
+    state_done_tx.send(()).unwrap();
+    state.join().unwrap();
+    assert!(matches!(recovered, CommandAck::CloseAccepted { .. }));
 }
 
 #[test]
@@ -466,21 +513,31 @@ fn response_deadline_is_bounded() {
 #[test]
 fn full_pending_queue_returns_stable_rejection() {
     const QUEUE_CAPACITY: usize = 8;
+    const QUEUE_FILL_PACING: Duration = Duration::from_millis(25);
 
     let name = pipe_name("queue-full");
-    let server = BrokerCommandServer::create(&name, TIMEOUT, TIMEOUT).unwrap();
-    let clients: Vec<_> = (0..=QUEUE_CAPACITY)
-        .map(|index| {
-            let client_name = name.clone();
-            std::thread::spawn(move || {
-                let mut request = open_path_request();
-                request.command_id = format!("command-{index}");
-                BrokerCommandClient::send(&client_name, &request, TIMEOUT, TIMEOUT)
-            })
-        })
-        .collect();
+    let (queue_full_tx, queue_full_rx) = mpsc::channel();
+    let events: Arc<dyn EventSink> = Arc::new(QueueFullSignal(Mutex::new(queue_full_tx)));
+    let server =
+        BrokerCommandServer::create_with_event_sink(&name, TIMEOUT, TIMEOUT, events).unwrap();
+    let mut clients = Vec::with_capacity(QUEUE_CAPACITY + 1);
+    for index in 0..=QUEUE_CAPACITY {
+        let mut request = open_path_request();
+        request.command_id = format!("command-{index}");
+        let mut client = connect_raw_client(&name, TIMEOUT).expect("connect queued client");
+        client
+            .write_all(&encode_frame(&request.encode_to_vec()).unwrap())
+            .unwrap();
+        wait_until_server_reads_request(&client);
+        clients.push(client);
+        if index < QUEUE_CAPACITY {
+            // Keep this scenario below decoder saturation so it specifically
+            // fills the already-decoded command queue.
+            std::thread::sleep(QUEUE_FILL_PACING);
+        }
+    }
 
-    std::thread::sleep(Duration::from_millis(200));
+    queue_full_rx.recv_timeout(TIMEOUT).unwrap();
     for _ in 0..QUEUE_CAPACITY {
         let pending = server.receive().unwrap();
         let command_id = pending.command().command_id().clone();
@@ -492,30 +549,40 @@ fn full_pending_queue_returns_stable_rejection() {
             .unwrap();
     }
 
-    let responses: Vec<_> = clients
-        .into_iter()
-        .map(|client| client.join().unwrap().unwrap())
-        .collect();
+    let responses: Vec<_> = clients.iter_mut().map(read_response).collect();
     assert_eq!(
         responses
             .iter()
-            .filter(|response| matches!(response, CommandAck::OpenAccepted { .. }))
+            .filter(|response| response.accepted)
             .count(),
         QUEUE_CAPACITY
     );
     assert_eq!(
         responses
             .iter()
-            .filter(|response| matches!(
-                response,
-                CommandAck::Rejected {
-                    reason: CommandRejectionCode::QueueFull,
-                    ..
-                }
-            ))
+            .filter(|response| !response.accepted && response.error_code == "queue-full")
             .count(),
         1
     );
+
+    let client_name = name.clone();
+    let recovered = std::thread::spawn(move || {
+        BrokerCommandClient::send(
+            &client_name,
+            &close_request("command-queue-recovered"),
+            TIMEOUT,
+            TIMEOUT,
+        )
+    });
+    let pending = server.receive().unwrap();
+    let command_id = pending.command().command_id().clone();
+    pending
+        .respond(CommandAck::CloseAccepted { command_id })
+        .unwrap();
+    assert!(matches!(
+        recovered.join().unwrap().unwrap(),
+        CommandAck::CloseAccepted { .. }
+    ));
 }
 
 fn create_raw_server(name: &str) -> File {

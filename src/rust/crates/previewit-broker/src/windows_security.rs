@@ -143,6 +143,15 @@ fn current_user_sid() -> Result<String, WindowsSecurityError> {
     Ok(sid)
 }
 
+#[doc(hidden)]
+pub fn current_user_sid_for_inspection() -> io::Result<String> {
+    current_user_sid().map_err(|error| match error {
+        WindowsSecurityError::Windows { operation, source } => {
+            io::Error::new(source.kind(), format!("{operation} failed: {source}"))
+        }
+    })
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
