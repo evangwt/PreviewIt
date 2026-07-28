@@ -10,7 +10,7 @@
 
 `windows-latest` now resolves to `windows-2025-vs2026`. `tools/build-legacy.ps1` deliberately discovers latest MSBuild, so it selects MSBuild 18.7.8. The QuickLook Native32 and Native64 projects then fail with `C1083` because `atlcomcli.h` is unavailable to that compiler environment.
 
-After pinning Windows Server 2022, the native projects compile, exposing installer failure: workflow writes `WixToolPath=$wixBin` without a trailing separator, while WiX v3 targets concatenate the tool name. The resulting `wix314bin\heat` path cannot exist.
+After pinning Windows Server 2022, the native projects compile, exposing installer failure: workflow writes `WIX=$wixRoot` without a trailing separator, while fixed QuickLook Installer PreBuildEvent concatenates `$(WIX)bin\heat`. The resulting `wix314bin\heat` path cannot exist.
 
 ## Considered approaches
 
@@ -26,17 +26,17 @@ Install or configure ATL explicitly on the VS 2026 runner. The image manifest al
 
 Hard-code include paths or replace ATL usage. This alters fixed upstream behavior to accommodate a CI image and risks incompatible binaries; it does not repair the environment selection error.
 
-### D. Correct WiX environment value — selected
+### D. Correct QuickLook WiX root value — selected
 
-Write `WixToolPath=$wixBin\`. WiX v3 targets own the tool invocation and require this path form; correcting the workflow value preserves the pinned archive, installer source, and existing build wrapper.
+Write `WIX=$wixRoot\`. QuickLook Installer owns this custom `heat` invocation; correcting its input preserves the pinned archive, installer source, and existing build wrapper.
 
 ## Accepted design
 
-Foundation runs on Windows Server 2022, which keeps the legacy solution on its known working Visual Studio generation. Its WiX install step writes a trailing separator in `WixToolPath`, allowing WiX v3 targets to locate `heat`. `build-legacy.ps1` retains ownership of MSBuild discovery and build invocation. Foundation gate runs a small workflow contract test first, so future edits cannot silently restore either requirement.
+Foundation runs on Windows Server 2022, which keeps the legacy solution on its known working Visual Studio generation. Its WiX install step writes a trailing separator in `WIX`, allowing QuickLook Installer's fixed PreBuildEvent to locate `heat`. `build-legacy.ps1` retains ownership of MSBuild discovery and build invocation. Foundation gate runs a small workflow contract test first, so future edits cannot silently restore either requirement.
 
 ## Verification
 
-1. Focused test fails for both floating runner label and missing WiX trailing separator.
-2. Set `windows-2022` and `WixToolPath=$wixBin\`.
+1. Focused test fails for both floating runner label and missing `WIX` trailing separator.
+2. Set `windows-2022` and `WIX=$wixRoot\`.
 3. Foundation gate invokes focused test first, then local `tools/test-foundation.ps1` stays green.
 4. GitHub Actions must complete `FOUNDATION_GATE_OK` on `windows-2022`, including installer packaging.

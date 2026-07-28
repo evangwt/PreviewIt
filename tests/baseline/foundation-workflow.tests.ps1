@@ -17,6 +17,10 @@ if (-not [regex]::IsMatch($foundationJob.Groups['body'].Value, '(?m)^    runs-on
     throw 'Foundation job must use runs-on: windows-2022'
 }
 
+if (-not [regex]::IsMatch($foundationJob.Groups['body'].Value, '(?m)^          "WIX=\$wixRoot\\" \| Out-File -FilePath \$env:GITHUB_ENV -Encoding utf8 -Append\r?$')) {
+    throw 'Foundation WiX root must end with a backslash'
+}
+
 if (-not [regex]::IsMatch($foundationJob.Groups['body'].Value, '(?m)^          "WixToolPath=\$wixBin\\" \| Out-File -FilePath \$env:GITHUB_ENV -Encoding utf8 -Append\r?$')) {
     throw 'Foundation WiX tool path must end with a backslash'
 }
