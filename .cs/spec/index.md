@@ -39,6 +39,12 @@
 
 - [为什么当前这样设计；被排除的替代方案和理由]
 
+## Foundation build gate
+
+Foundation CI 固定运行于 `windows-2022`，保持 QuickLook 4.5 已验证的 VS 2022 / MSBuild 17 工具链；不使用会随镜像迁移的 `windows-latest`。
+
+CI 提供的 WiX `WIX` root 必须以路径分隔符结束。固定 Installer 构建会在此 root 后追加 `bin\heat`；这一环境契约保证打包工具能被找到，不改动上游 QuickLook 源码或其 include path。
+
 ## 证据索引（按需）
 
 - [代码、文档或命令证据；只用于验证上文理解，不替代需求和架构说明]

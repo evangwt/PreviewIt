@@ -113,7 +113,7 @@ Do not commit or push automatically. With user authorization, commit workflow, t
 ### Task 3: Verify hosted environment
 
 **Files:**
-- Modify: `.cs/issues/2026/07/28/open-foundation-ci-gate-failure.md`
+- Modify: `.cs/issues/2026/07/28/closed-foundation-ci-gate-failure.md`
 
 **Step 1: Push and observe CI after explicit authorization**
 

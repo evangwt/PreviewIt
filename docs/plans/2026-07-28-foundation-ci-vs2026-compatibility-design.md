@@ -2,7 +2,7 @@
 
 **Status:** Approved by the user on 2026-07-28.
 
-**Source of truth:** `.cs/issues/2026/07/28/open-foundation-ci-gate-failure.md`. This document preserves accepted choice; Issue remains authoritative if wording differs.
+**Source of record:** `.cs/issues/2026/07/28/closed-foundation-ci-gate-failure.md`. This document preserves accepted choice; closed Issue records final evidence and wording.
 
 **Scope:** Restore Foundation CI for QuickLook 4.5 baseline. Do not change QuickLook source, native include paths, warning policy, WiX version, Rust setup, existing gate-step order, or production behavior. Prepend one workflow contract check to Foundation gate.
 

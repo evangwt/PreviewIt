@@ -2,7 +2,7 @@
 kind: issue
 title: "Foundation CI gate 在 GitHub-hosted Windows 失败"
 type: bug
-status: open
+status: closed
 created: 2026-07-28
 epic: ""
 ---
@@ -117,14 +117,16 @@ workflow 继续只负责提供可复现宿主环境与调用 Foundation gate；g
 
 ## 关闭回写
 
-- project spec / epic spec：无，除非定位出长期 CI/构建约束。
-- notes：若 GitHub-hosted runner 有可复用诊断限制或固定工具链约束，记录至 `.cs/notes/`。
+- project spec：`.cs/spec/index.md` 的“Foundation build gate”记录固定 `windows-2022`、VS 2022/MSBuild 17 与 `WIX` root 分隔符契约；它们是固定 QuickLook 4.5 基线的长期构建边界。
+- epic spec：无。
+- notes：无；具体诊断链与远端证据留在本 issue，未形成独立复用流程。
 - AGENTS.md / CLAUDE.md：无。
-- tools：若确证 restore/build 需独立步骤，更新对应 build tool 与回归测试。
+- tools：无；未确证 restore/build 必须拆分。
 
 ## 关闭结论
 
 - 根因摘要：`windows-latest` 漂移至 VS 2026，MSBuild 18 不能编译 QuickLook ATL；Windows 2022 解除该阻断后，workflow 的无分隔符 `WIX` 被固定 QuickLook PreBuildEvent 与 `bin\heat` 拼接。
 - 修复摘要：Foundation runner 固定为 `windows-2022`；workflow contract 覆盖 runner、QuickLook 实际读取的 `WIX` root 与 gate 接入；`WIX` 现在以 `\` 结束。
-- 验证摘要：三个 contract 均经历 RED/GREEN；完整本地 gate 与 GitHub-hosted run `30349804395` 均输出 `FOUNDATION_GATE_OK`。
-- 遗留事项：修复已验证；等待用户明确关闭 issue。
+- 验证摘要：三个 contract 均经历 RED/GREEN；完整本地 gate 与 GitHub-hosted runs `30349804395`、`30350253823` 均输出 `FOUNDATION_GATE_OK`。
+- 关闭判断：用户于 2026-07-28 明确确认关闭；目标、范围与验证全部满足。
+- 遗留事项：无。
