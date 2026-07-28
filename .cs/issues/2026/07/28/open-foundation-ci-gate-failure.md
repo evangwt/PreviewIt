@@ -29,7 +29,7 @@ epic: ""
 
 - 命令或操作入口：GitHub Actions `Foundation` workflow，run `30334754040`。
 - 断言的具体症状：`Run foundation gate` 不输出 `FOUNDATION_GATE_OK`，job exit code 为 1。
-- 最近一次结果：commit `014d0fd` 的 run `30348585289` 已证明 `WixToolPath` 带尾随分隔符仍不足；VS 2022 runner 完成 native build，但 QuickLook Installer 的自定义 PreBuildEvent 由 `$(WIX)bin\heat` 生成 `D:\a\_temp\wix314bin\heat` 并报 `MSB3073`。
+- 最近一次结果：commit `b143a2d` 的 run `30349804395` 在 GitHub-hosted `windows-2022` runner 完整成功；日志显示 `WIX: D:\a\_temp\wix314\`、MSBuild 17.14.51，并输出 `FOUNDATION_GATE_OK`。
 - red-capable / 确定性 / 速度 / agent 可运行性：历史远端 job 是 red-capable；当前本机无 VS 2026 runner，不能直接重现 header 缺失。变更后须由新的远端 workflow run 验证。
 
 ## 复现与最小化
@@ -98,6 +98,7 @@ workflow 继续只负责提供可复现宿主环境与调用 Foundation gate；g
 - `pwsh -NoProfile -File tools/test-foundation.ps1`：WiX path 修复后可复现 PASS，238.6 秒，输出 `FOUNDATION_GATE_OK`。
 - `pwsh -NoProfile -File tests/baseline/foundation-workflow.tests.ps1`：针对 `WIX` root 断言先 RED，报 `Foundation WiX root must end with a backslash`；写入 `$wixRoot\` 后 PASS。
 - `pwsh -NoProfile -File tools/test-foundation.ps1`：`WIX` root 修复后 PASS，237.7 秒，输出 `FOUNDATION_GATE_OK`。
+- GitHub Actions run `30349804395`：`b143a2d` 在 `windows-2022` 完整 PASS，job `90244365530` 于 2026-07-28 10:17:29 UTC 完成；环境记录 `WIX: D:\a\_temp\wix314\`，最终输出 `FOUNDATION_GATE_OK`。
 
 ## 执行记录
 
@@ -108,6 +109,7 @@ workflow 继续只负责提供可复现宿主环境与调用 Foundation gate；g
 - 2026-07-28：按 TDD 扩展 workflow contract，先观察 WiX path 的 RED，再以尾随分隔符修复 `WixToolPath`；focused test 与完整本地 gate 通过。待提交并验证第二次远端 run。
 - 2026-07-28：commit `014d0fd` 的 run `30348585289` 仍失败；日志同时显示带尾随分隔符的 `WixToolPath` 和错误的 `D:\a\_temp\wix314bin\heat`。读取固定 QuickLook Installer PreBuildEvent 后，确认命令直接读取 `WIX`，而非 `WixToolPath`。
 - 2026-07-28：按 TDD 新增 `WIX` root contract，先观察预期 RED，再将 workflow 写入值改为 `$wixRoot\`。focused contract 与完整本地 Foundation gate 均 PASS；待提交并验证下一次 GitHub-hosted run。
+- 2026-07-28：提交并推送 `b143a2d` 后，run `30349804395` 完整通过；GitHub-hosted 环境确认 `WIX` 含尾随分隔符、MSBuild 17.14.51 与 `FOUNDATION_GATE_OK`。issue 等待用户明确关闭。
 
 ## 顺手发现
 
@@ -124,5 +126,5 @@ workflow 继续只负责提供可复现宿主环境与调用 Foundation gate；g
 
 - 根因摘要：`windows-latest` 漂移至 VS 2026，MSBuild 18 不能编译 QuickLook ATL；Windows 2022 解除该阻断后，workflow 的无分隔符 `WIX` 被固定 QuickLook PreBuildEvent 与 `bin\heat` 拼接。
 - 修复摘要：Foundation runner 固定为 `windows-2022`；workflow contract 覆盖 runner、QuickLook 实际读取的 `WIX` root 与 gate 接入；`WIX` 现在以 `\` 结束。
-- 验证摘要：三个 contract 均经历 RED/GREEN；完整本地 gate 于 `WIX` root 修复后 PASS，输出 `FOUNDATION_GATE_OK`。
-- 遗留事项：提交/推送 `WIX` root 修复，并确认新的 GitHub-hosted Windows 2022 run 完整通过；之后才可关闭 issue。
+- 验证摘要：三个 contract 均经历 RED/GREEN；完整本地 gate 与 GitHub-hosted run `30349804395` 均输出 `FOUNDATION_GATE_OK`。
+- 遗留事项：修复已验证；等待用户明确关闭 issue。
