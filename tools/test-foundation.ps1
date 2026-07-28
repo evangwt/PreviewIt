@@ -17,6 +17,7 @@ function Invoke-Checked {
     }
 }
 
+Invoke-Checked 'workflow-runner' { pwsh -NoProfile -File tests/baseline/foundation-workflow.tests.ps1 }
 Invoke-Checked 'quicklook-provenance' { pwsh -NoProfile -File tools/upstream/verify-quicklook-baseline.ps1 }
 Invoke-Checked 'legacy-build' { pwsh -NoProfile -File tests/baseline/legacy-build.tests.ps1 }
 Invoke-Checked 'rustfmt' { cargo fmt --manifest-path src/rust/Cargo.toml --all -- --check }
